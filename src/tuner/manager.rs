@@ -561,7 +561,13 @@ impl TunerManager {
                 s.record_success();
                 s.process = Some(proc);
                 s.pid = Some(pid);
-                s.process_generation = s.process_generation.wrapping_add(1);
+                // A respawn replaces the OS process but keeps the logical
+                // request leases.  The generation returned to HTTP bodies is
+                // therefore advanced only for a fresh/takeover stream; old
+                // bodies must still be able to release after respawn.
+                if !preserve_senders {
+                    s.process_generation = s.process_generation.wrapping_add(1);
+                }
                 s.current_channel = Some(physical_channel.to_owned());
                 s.wanted_channel = Some(physical_channel.to_owned());
                 if !preserve_senders {
@@ -954,11 +960,26 @@ impl TunerManager {
         &self,
         index: usize,
     ) -> Result<mpsc::Receiver<Vec<u8>>, String> {
+        let generation = self.slot_mutex(index)?.lock().await.process_generation;
+        self.create_subscription_for_generation(index, generation).await
+    }
+
+    /// Attach a subscriber only if the process observed by `acquire` is still
+    /// the active process generation.  Acquisition and attachment are
+    /// separate awaits, so this check must live under the slot lock.
+    pub async fn create_subscription_for_generation(
+        &self,
+        index: usize,
+        expected_generation: u64,
+    ) -> Result<mpsc::Receiver<Vec<u8>>, String> {
         let mut s = self.slot_mutex(index)?.lock().await;
         if s.state.is_terminal() {
             return Err(format!("tuner {index} is terminal"));
         }
-        if s.state != TunerState::Streaming || s.process.is_none() {
+        if s.state != TunerState::Streaming
+            || s.process.is_none()
+            || s.process_generation != expected_generation
+        {
             return Err(format!("tuner {index} is not streaming"));
         }
         let (tx, rx) = mpsc::channel(STREAM_QUEUE_LEN);
@@ -1406,7 +1427,12 @@ impl TunerManager {
 mod tests {
     use super::*;
     use crate::config::ChannelType;
+    use crate::tuner::process::test_fixture_command;
     use std::collections::HashMap;
+
+    fn fixture(mode: &str) -> String {
+        test_fixture_command(mode)
+    }
 
     fn tuner_with_command(name: &str, command: Option<&str>) -> Tuner {
         Tuner {
@@ -1466,7 +1492,7 @@ mod tests {
     #[tokio::test]
     async fn start_stop_with_sleep() {
         let m =
-            TunerManager::new(vec![tuner_with_command("t", Some("sleep 30"))]);
+            TunerManager::new(vec![tuner_with_command("t", Some(&fixture("hold")))]);
         let pid = m.start(0, "13").await.expect("spawn sleep");
         assert!(pid > 0);
         assert_eq!(m.state(0).await.unwrap(), TunerState::Streaming);
@@ -1477,7 +1503,7 @@ mod tests {
     #[tokio::test]
     async fn acquire_same_channel_shares() {
         let m =
-            TunerManager::new(vec![tuner_with_command("t", Some("sleep 30"))]);
+            TunerManager::new(vec![tuner_with_command("t", Some(&fixture("hold")))]);
         let a = m.acquire(0, "13").await.unwrap();
         let b = m.acquire(0, "13").await.unwrap();
         assert_eq!(a, b);
@@ -1492,8 +1518,8 @@ mod tests {
     #[tokio::test]
     async fn stop_all_stops_every_slot() {
         let m = TunerManager::new(vec![
-            tuner_with_command("a", Some("sleep 30")),
-            tuner_with_command("b", Some("sleep 30")),
+            tuner_with_command("a", Some(&fixture("hold"))),
+            tuner_with_command("b", Some(&fixture("hold"))),
         ]);
         m.start(0, "13").await.unwrap();
         m.start(1, "13").await.unwrap();
@@ -1504,14 +1530,14 @@ mod tests {
 
     #[tokio::test]
     async fn stop_all_rejects_later_starts() {
-        let m = TunerManager::new(vec![tuner_with_command("t", Some("sleep 30"))]);
+        let m = TunerManager::new(vec![tuner_with_command("t", Some(&fixture("hold")))]);
         m.stop_all().await;
         assert!(m.start(0, "13").await.is_err());
     }
 
     #[tokio::test]
     async fn shutdown_cannot_leave_a_racing_start_streaming() {
-        let m = TunerManager::shared(vec![tuner_with_command("t", Some("sleep 30"))]);
+        let m = TunerManager::shared(vec![tuner_with_command("t", Some(&fixture("hold")))]);
         let start = {
             let m = Arc::clone(&m);
             tokio::spawn(async move { m.start(0, "13").await })
@@ -1525,7 +1551,7 @@ mod tests {
     #[tokio::test]
     async fn poll_exit_respawns_on_clean_exit_with_demand() {
         // 正常終了+残存要求でも EBUSY にならず respawn すること (NG1回帰)。
-        let m = TunerManager::new(vec![tuner_with_command("t", Some("true"))]);
+        let m = TunerManager::new(vec![tuner_with_command("t", Some(&fixture("exit-success")))]);
         let pid = m.start(0, "13").await.expect("spawn true");
         assert!(pid > 0);
         let mut respawned: Option<Option<u32>> = None;
@@ -1551,10 +1577,7 @@ mod tests {
 
     #[tokio::test]
     async fn poll_exit_does_not_respawn_after_release_during_wait() {
-        let m = TunerManager::shared(vec![tuner_with_command(
-            "t",
-            Some("sh -c 'sleep 0.05; exit 0'"),
-        )]);
+        let m = TunerManager::shared(vec![tuner_with_command("t", Some(&fixture("respawn")))]);
         let (_, generation) = m.start_with_priority(0, "13", 0).await.unwrap();
 
         // Ensure poll_exit observes the exited process and is in its release
@@ -1579,7 +1602,7 @@ mod tests {
     async fn busy_and_spawn_failure_are_separate_errors() {
         // High: 文字列contains判定の廃止。BusyとSpawn失敗をenumで分離する。
         let m = TunerManager::shared(vec![
-            tuner_with_command("ok", Some("sleep 30")),
+            tuner_with_command("ok", Some(&fixture("hold"))),
             tuner_with_command("ng", Some("/nonexistent-hotarun-cmd-xyz")),
         ]);
         // 稼働中への二重起動はBusy (再試行可)。
@@ -1602,7 +1625,7 @@ mod tests {
     #[tokio::test]
     async fn sharing_candidate_only_for_same_phys_streaming() {
         // High: 同一physは共有/fan-out (acquire使用)。別chは共有しない。
-        let m = TunerManager::new(vec![tuner_with_command("t", Some("sleep 30"))]);
+        let m = TunerManager::new(vec![tuner_with_command("t", Some(&fixture("hold")))]);
         m.start(0, "13").await.unwrap();
         assert!(m.is_sharing_candidate(0, "13").await);
         assert!(!m.is_sharing_candidate(0, "27").await);
@@ -1619,7 +1642,7 @@ mod tests {
 
     #[tokio::test]
     async fn higher_priority_request_takes_over_lower_priority_stream() {
-        let m = TunerManager::shared(vec![tuner_with_command("t", Some("sleep 30"))]);
+        let m = TunerManager::shared(vec![tuner_with_command("t", Some(&fixture("hold")))]);
         let (_, low_generation) = m
             .start_monitored_with_priority(0, "13", 10)
             .await
@@ -1652,7 +1675,7 @@ mod tests {
         // §10: 同一Tuner Processを複数clientへfan-outする。
         let m = TunerManager::shared(vec![tuner_with_command(
             "t",
-            Some("echo hello-fanout"),
+            Some(&fixture("fanout")),
         )]);
         m.start(0, "13").await.unwrap();
         let mut rx1 = m.create_subscription(0).await.expect("sub1");
@@ -1678,7 +1701,7 @@ mod tests {
     async fn release_hint_and_stop_if_idle_cleanup_without_leak() {
         // High: 切断後リーク防止。Drop相当の同期ヒント+非同期停止で確実にIDLEへ。
         // fire-and-forget単独にせず、ヒントが残ってもstop_if_idle/watcherで回収する。
-        let m = TunerManager::new(vec![tuner_with_command("t", Some("sleep 30"))]);
+        let m = TunerManager::new(vec![tuner_with_command("t", Some(&fixture("hold")))]);
         m.start(0, "13").await.unwrap();
         assert_eq!(m.use_count(0).await.unwrap(), 1);
         // 同期ヒント (await不可文脈相当) で需要を減らす。
@@ -1694,7 +1717,7 @@ mod tests {
     async fn stop_if_idle_does_not_stop_a_concurrent_acquire() {
         // stop_if_idle must perform its demand check and process take under one
         // slot lock. If acquire wins that lock, the active process is retained.
-        let m = TunerManager::shared(vec![tuner_with_command("t", Some("sleep 30"))]);
+        let m = TunerManager::shared(vec![tuner_with_command("t", Some(&fixture("hold")))]);
         for _ in 0..10 {
             if m.state(0).await.unwrap() == TunerState::Idle {
                 let _ = m.start(0, "13").await.unwrap();
@@ -1714,7 +1737,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_release_keeps_process_for_three_second_grace_and_reuses_it() {
-        let m = TunerManager::shared(vec![tuner_with_command("t", Some("sleep 30"))]);
+        let m = TunerManager::shared(vec![tuner_with_command("t", Some(&fixture("hold")))]);
         let (_, generation) = m.acquire_with_priority(0, "13", 0).await.unwrap();
         let pid = m.pid(0).await.unwrap();
         m.release_lease(0, generation, Some(0)).await.unwrap();
@@ -1735,7 +1758,7 @@ mod tests {
     async fn respawn_keeps_all_existing_subscribers() {
         let m = TunerManager::shared(vec![tuner_with_command(
             "t",
-            Some("sh -c 'sleep 0.05; printf respawn-data'")
+            Some(&fixture("respawn"))
         )]);
         m.start(0, "13").await.unwrap();
         let mut rx1 = m.create_subscription(0).await.unwrap();
@@ -1778,8 +1801,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn respawned_process_keeps_the_original_lease_generation() {
+        let m = TunerManager::shared(vec![tuner_with_command("t", Some(&fixture("respawn")))]);
+        let (_, generation) = m.start_with_priority(0, "13", 0).await.unwrap();
+        let mut subscription = m.create_subscription_for_generation(0, generation).await.unwrap();
+        let stdout = m.take_stdout(0).await.unwrap().unwrap();
+        m.spawn_pump(0, stdout);
+        assert_eq!(subscription.recv().await.unwrap(), b"respawn-data");
+
+        let (_, new_pid) = loop {
+            if let Ok((true, Some(pid))) = m.poll_exit(0).await {
+                let stdout = m.take_stdout(0).await.unwrap().unwrap();
+                m.spawn_pump(0, stdout);
+                break (true, pid);
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(new_pid > 0);
+        assert_eq!(m.use_count(0).await.unwrap(), 1);
+        m.release_lease(0, generation, Some(0)).await.unwrap();
+        assert_eq!(m.use_count(0).await.unwrap(), 0);
+        m.stop(0).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_rejects_a_stale_process_generation() {
+        let m = TunerManager::shared(vec![tuner_with_command("t", Some(&fixture("hold")))]);
+        let (_, generation) = m.acquire_with_priority(0, "13", 0).await.unwrap();
+        assert!(m
+            .create_subscription_for_generation(0, generation.wrapping_add(1))
+            .await
+            .is_err());
+        assert_eq!(m.use_count(0).await.unwrap(), 1);
+        m.release_lease(0, generation, Some(0)).await.unwrap();
+        m.stop(0).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn fault_closes_existing_subscriber() {
-        let m = TunerManager::shared(vec![tuner_with_command("t", Some("sleep 30"))]);
+        let m = TunerManager::shared(vec![tuner_with_command("t", Some(&fixture("hold")))]);
         let (tx, mut rx) = mpsc::channel(1);
         {
             let mut slot = m.slots[0].lock().await;
@@ -1794,7 +1854,7 @@ mod tests {
 
     #[tokio::test]
     async fn fanout_overflow_is_counted_and_closes_subscriber() {
-        let m = TunerManager::shared(vec![tuner_with_command("t", Some("sleep 30"))]);
+        let m = TunerManager::shared(vec![tuner_with_command("t", Some(&fixture("hold")))]);
         m.start(0, "13").await.unwrap();
         let mut rx = m.create_subscription(0).await.unwrap();
         let before = STREAM_FANOUT_OVERFLOWS.load(Ordering::Relaxed);

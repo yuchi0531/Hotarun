@@ -176,7 +176,6 @@ impl AppState {
     }
 
     /// テスト用: channels/tuners から state を組み立てる。
-    #[cfg(test)]
     pub fn from_lists(channels: Vec<Channel>, tuners: Vec<Tuner>) -> Self {
         let manager = crate::tuner::TunerManager::shared(tuners.clone());
         Self {

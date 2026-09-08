@@ -53,8 +53,14 @@ pub struct SpawnedDecoder {
 #[derive(Debug, Default)]
 pub struct DecoderRegistry {
     next_id: AtomicU64,
-    entries: Mutex<HashMap<u64, Arc<Mutex<Option<SpawnedDecoder>>>>>,
+    state: Mutex<DecoderRegistryState>,
     shutdown: Arc<Notify>,
+}
+
+#[derive(Debug, Default)]
+struct DecoderRegistryState {
+    closing: bool,
+    entries: HashMap<u64, Arc<Mutex<Option<SpawnedDecoder>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,17 +75,44 @@ impl DecoderRegistry {
         Arc::new(Self::default())
     }
 
-    pub fn register(self: &Arc<Self>, decoder: SpawnedDecoder) -> RegisteredDecoder {
+    /// Register a decoder unless shutdown has started.  The closing check and
+    /// insertion share one mutex with `stop_all`'s drain, so no decoder can
+    /// appear after the shutdown drain.
+    pub async fn register(
+        self: &Arc<Self>,
+        decoder: SpawnedDecoder,
+    ) -> Result<RegisteredDecoder, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let process = Arc::new(Mutex::new(Some(decoder)));
-        self.entries.lock().expect("decoder registry poisoned").insert(id, Arc::clone(&process));
-        RegisteredDecoder { id, registry: Arc::clone(self), process }
+        let accepted = {
+            let mut state = self.state.lock().expect("decoder registry poisoned");
+            if state.closing {
+                false
+            } else {
+                state.entries.insert(id, Arc::clone(&process));
+                true
+            }
+        };
+        if !accepted {
+            let decoder = {
+                let mut process = process.lock().expect("decoder process poisoned");
+                process.take()
+            };
+            if let Some(mut decoder) = decoder {
+                stop_decoder(&mut decoder)
+                    .await
+                    .map_err(|error| format!("decoder shutdown failed: {error}"))?;
+            }
+            return Err("decoder registry is shutting down".to_owned());
+        }
+        Ok(RegisteredDecoder { id, registry: Arc::clone(self), process })
     }
 
     pub fn active_count(&self) -> usize {
-        self.entries
+        self.state
             .lock()
             .expect("decoder registry poisoned")
+            .entries
             .len()
     }
 
@@ -93,13 +126,11 @@ impl DecoderRegistry {
         // Wake the pipe tasks first. Killing the children below then unblocks
         // any write/read that was already in progress.
         self.shutdown.notify_waiters();
-        let processes = self
-            .entries
-            .lock()
-            .expect("decoder registry poisoned")
-            .drain()
-            .map(|(_, process)| process)
-            .collect::<Vec<_>>();
+        let processes = {
+            let mut state = self.state.lock().expect("decoder registry poisoned");
+            state.closing = true;
+            state.entries.drain().map(|(_, process)| process).collect::<Vec<_>>()
+        };
         for process in processes {
             let decoder = process.lock().expect("decoder process poisoned").take();
             if let Some(mut decoder) = decoder {
@@ -109,6 +140,21 @@ impl DecoderRegistry {
             }
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_fixture_command(mode: &str) -> String {
+    let path = std::env::var("CARGO_BIN_EXE_hotarun-test-fixture").unwrap_or_else(|_| {
+        std::env::current_exe()
+            .expect("test executable path")
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("target directory")
+            .join("hotarun-test-fixture")
+            .display()
+            .to_string()
+    });
+    format!("{path} {mode}")
 }
 
 impl RegisteredDecoder {
@@ -128,9 +174,10 @@ impl RegisteredDecoder {
             }
         }
         self.registry
-            .entries
+            .state
             .lock()
             .expect("decoder registry poisoned")
+            .entries
             .remove(&self.id);
     }
 }
@@ -330,11 +377,46 @@ pub async fn stop_process(proc: &mut SpawnedTuner) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn fixture_program() -> String {
+        std::env::var("CARGO_BIN_EXE_hotarun-test-fixture").unwrap_or_else(|_| {
+            std::env::current_exe()
+                .expect("test executable path")
+                .parent()
+                .and_then(|path| path.parent())
+                .expect("target directory")
+                .join("hotarun-test-fixture")
+                .display()
+                .to_string()
+        })
+    }
+
     #[test]
     fn dvbv5_only_is_immediate_kill() {
         assert!(is_immediate_kill_program("dvbv5-zap"));
         assert!(is_immediate_kill_program("/usr/bin/dvbv5-zap"));
         assert!(!is_immediate_kill_program("recpt1"));
         assert!(!is_immediate_kill_program("/usr/bin/recdvb"));
+    }
+
+    #[tokio::test]
+    async fn decoder_shutdown_serializes_drain_and_late_registration() {
+        let registry = DecoderRegistry::new();
+        let decoder = spawn_decoder_program(&fixture_program(), &["hold".to_owned()])
+            .await
+            .expect("fixture decoder");
+        let ((), result) = tokio::join!(registry.stop_all(), registry.register(decoder));
+        if let Ok(registered) = result {
+            // Registration won the mutex before shutdown; stop_all must still
+            // have drained and reaped it rather than leaving an entry behind.
+            assert!(registered.take_stdin().is_none());
+        }
+        assert_eq!(registry.active_count(), 0);
+
+        let decoder = spawn_decoder_program(&fixture_program(), &["hold".to_owned()])
+            .await
+            .expect("fixture decoder");
+        let result = registry.register(decoder).await;
+        assert!(result.is_err(), "registration after shutdown must be rejected");
+        assert_eq!(registry.active_count(), 0);
     }
 }

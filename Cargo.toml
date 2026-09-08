@@ -7,6 +7,10 @@ edition = "2021"
 name = "hotarun"
 path = "src/main.rs"
 
+[[bin]]
+name = "hotarun-test-fixture"
+path = "src/bin/hotarun-test-fixture.rs"
+
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "process", "io-util", "time", "sync"] }
@@ -17,3 +21,6 @@ tracing = "0.1"
 libc = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 http-body = "1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

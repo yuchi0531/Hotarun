@@ -118,14 +118,21 @@ async fn acquire_tuner(
             }
             match state.manager.acquire_with_priority(idx, &phys, priority).await {
                 Ok((_pid, generation)) => {
-                    match state.manager.create_subscription(idx).await {
+                    match state
+                        .manager
+                        .create_subscription_for_generation(idx, generation)
+                        .await
+                    {
                         Ok(rx) => {
                             tracing::info!(tuner = idx, channel = %phys, "stream tuner shared");
                             return Ok((idx, rx, generation));
                         }
                         Err(e) => {
                             tracing::warn!(tuner = idx, error = %e, "share subscribe failed");
-                            let _ = state.manager.release(idx).await;
+                            let _ = state
+                                .manager
+                                .release_lease(idx, generation, Some(priority))
+                                .await;
                             continue;
                         }
                     }
@@ -173,7 +180,11 @@ async fn acquire_tuner(
                     .await
                 {
                     Ok((_pid, generation)) => {
-                        let rx = match state.manager.create_subscription(idx).await {
+                        let rx = match state
+                            .manager
+                            .create_subscription_for_generation(idx, generation)
+                            .await
+                        {
                             Ok(rx) => rx,
                             Err(e) => {
                                 let _ = state.manager.release_lease(idx, generation, Some(priority)).await;
@@ -228,10 +239,17 @@ async fn acquire_tuner(
             {
                 Ok((pid, generation)) => {
                     // 初回購読 + pump起動。失敗時は確保を取り消して500。
-                    let rx = match state.manager.create_subscription(idx).await {
+                    let rx = match state
+                        .manager
+                        .create_subscription_for_generation(idx, generation)
+                        .await
+                    {
                         Ok(rx) => rx,
                         Err(e) => {
-                            let _ = state.manager.release(idx).await;
+                            let _ = state
+                                .manager
+                                .release_lease(idx, generation, Some(priority))
+                                .await;
                             return Err(ApiError::new(
                                 500,
                                 format!("failed to attach stream: {e}"),
@@ -241,14 +259,20 @@ async fn acquire_tuner(
                     let stdout = match state.manager.take_stdout(idx).await {
                         Ok(Some(s)) => s,
                         Ok(None) => {
-                            let _ = state.manager.release(idx).await;
+                            let _ = state
+                                .manager
+                                .release_lease(idx, generation, Some(priority))
+                                .await;
                             return Err(ApiError::new(
                                 500,
                                 "tuner has no stdout".to_owned(),
                             ));
                         }
                         Err(e) => {
-                            let _ = state.manager.release(idx).await;
+                            let _ = state
+                                .manager
+                                .release_lease(idx, generation, Some(priority))
+                                .await;
                             return Err(ApiError::new(
                                 500,
                                 format!("failed to take tuner stdout: {e}"),
@@ -624,6 +648,7 @@ fn packet_payload(packet: &[u8; 188]) -> Option<&[u8]> {
     (offset < 188).then_some(&packet[offset..])
 }
 
+#[cfg(test)]
 fn section(payload: &[u8], table_id: u8) -> Option<&[u8]> {
     if payload.first().copied()? != table_id || payload.len() < 3 {
         return None;
@@ -775,7 +800,16 @@ async fn spawn_decoded_body(
             ));
         }
     };
-    let decoder = state.decoders.register(decoder);
+    let decoder = match state.decoders.register(decoder).await {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            let _ = state
+                .manager
+                .release_lease(idx, generation, Some(priority))
+                .await;
+            return Err(ApiError::new(503, error));
+        }
+    };
     let Some(mut stdin) = decoder.take_stdin() else {
         decoder.stop().await;
         let _ = state
@@ -1037,9 +1071,14 @@ pub fn router() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppState, Channel, Tuner};
+    use crate::config::{AppState, Channel, ChannelType, Tuner};
+    use crate::tuner::process::test_fixture_command;
     use crate::tuner::TunerManager;
     use std::collections::HashMap;
+
+    fn fixture(mode: &str) -> String {
+        test_fixture_command(mode)
+    }
 
     fn bs4k_state(tuner_command: &str, tlv_decoder: Option<&str>) -> Arc<AppState> {
         Arc::new(AppState::from_lists(
@@ -1122,7 +1161,7 @@ mod tests {
     #[tokio::test]
     async fn bs4k_channel_passthrough_keeps_tlv_bytes_and_resolves_physical_channel() {
         let state = bs4k_state(
-            "python3 -c \"import sys; sys.stdout.buffer.write(b'TLV-raw-45328')\"",
+            &fixture("raw"),
             None,
         );
         let response = get_channel_stream(
@@ -1145,8 +1184,8 @@ mod tests {
     #[tokio::test]
     async fn bs4k_decoder_is_a_per_request_pipe_without_shell_expansion() {
         let state = bs4k_state(
-            "python3 -c \"import sys; sys.stdout.buffer.write(b'lower')\"",
-            Some("python3 -c \"import sys; sys.stdout.buffer.write(sys.stdin.buffer.read(5).upper())\""),
+            &fixture("lower"),
+            Some(&fixture("decoder-upper")),
         );
         let response = get_channel_stream(
             Arc::clone(&state),
@@ -1165,7 +1204,7 @@ mod tests {
     #[tokio::test]
     async fn bs4k_decode_zero_bypasses_configured_decoder() {
         let state = bs4k_state(
-            "python3 -c \"import sys; sys.stdout.buffer.write(b'lower')\"",
+            &fixture("lower"),
             Some("/definitely/missing-tlv-decoder"),
         );
         let response = get_channel_stream(
@@ -1185,7 +1224,7 @@ mod tests {
     #[tokio::test]
     async fn bs4k_service_returns_same_tlv_without_ts_pid_filter() {
         let state = bs4k_state(
-            "python3 -c \"import sys; sys.stdout.buffer.write(bytes([71,0,1,84,76,86]))\"",
+            &fixture("ts"),
             None,
         );
         let response = service_stream(
@@ -1203,7 +1242,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_bs4k_physical_channel_shares_one_tuner_process() {
-        let state = bs4k_state("python3 -c \"import time; time.sleep(30)\"", None);
+        let state = bs4k_state(&fixture("hold"), None);
         let channel = state.channels[0].clone();
         let (idx1, _rx1, generation1) = acquire_tuner(&state, ChannelType::BS4K, &channel, 0)
             .await
@@ -1233,7 +1272,7 @@ mod tests {
     #[tokio::test]
     async fn decoder_spawn_failure_releases_tuner_lease() {
         let state = bs4k_state(
-            "python3 -c \"import sys; sys.stdout.buffer.write(b'bytes')\"",
+            &fixture("bytes"),
             Some("/definitely/missing-tlv-decoder"),
         );
         let error = match get_channel_stream(
@@ -1269,7 +1308,7 @@ mod tests {
                 vec![Tuner {
                     name: "tuner".to_owned(),
                     types: vec![ChannelType::BS],
-                    command: Some("sleep 30".to_owned()),
+                    command: Some(fixture("hold")),
                     tlv_decoder: None,
                     decoder: None,
                     extra: HashMap::new(),
@@ -1306,8 +1345,8 @@ mod tests {
     #[tokio::test]
     async fn decoder_registry_shutdown_ends_body_without_stdin_eof() {
         let state = bs4k_state(
-            "python3 -c \"import time; time.sleep(30)\"",
-            Some("python3 -c \"import time; time.sleep(30)\""),
+            &fixture("hold"),
+            Some(&fixture("decoder-hold")),
         );
         let response = get_channel_stream(
             Arc::clone(&state),
@@ -1332,7 +1371,7 @@ mod tests {
 
     #[tokio::test]
     async fn bs4k_type_and_missing_channel_are_not_cross_matched() {
-        let state = bs4k_state("sleep 30", None);
+        let state = bs4k_state(&fixture("hold"), None);
         let wrong_type = get_stream(
             State(Arc::clone(&state)),
             Path((String::from("BS"), String::from("logical"))),
@@ -1384,7 +1423,7 @@ mod tests {
             vec![Tuner {
                 name: "bs4k".to_owned(),
                 types: vec![ChannelType::BS4K],
-                command: Some("python3 -c \"import time; time.sleep(30)\"".to_owned()),
+                command: Some(fixture("hold")),
                 tlv_decoder: None,
                 decoder: None,
                 extra: HashMap::new(),
@@ -1411,8 +1450,8 @@ mod tests {
     #[tokio::test]
     async fn decoder_exit_after_headers_is_a_clean_eof_without_lease_leak() {
         let state = bs4k_state(
-            "python3 -c \"import sys; sys.stdout.buffer.write(b'bytes')\"",
-            Some("python3 -c \"import sys; sys.exit(1)\""),
+            &fixture("bytes"),
+            Some(&fixture("fail")),
         );
         let response = get_channel_stream(
             Arc::clone(&state),

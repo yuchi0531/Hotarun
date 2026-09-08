@@ -1,15 +1,8 @@
-mod config;
-mod error;
-mod routes;
-mod tuner;
-
 use std::{net::SocketAddr, sync::Arc};
 
-use axum::Router;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use config::AppState;
-use error::{fallback_404, method_not_allowed_405};
+use hotarun::config::AppState;
 
 const DEFAULT_PORT: u16 = 40772;
 const DEFAULT_CONFIG_DIR: &str = "/etc/hotarun";
@@ -98,13 +91,7 @@ async fn main() {
         "config loaded"
     );
 
-    let app: Router = routes::config::router()
-        .merge(routes::api::router())
-        .merge(routes::stream::router())
-        .fallback(fallback_404)
-        .method_not_allowed_fallback(method_not_allowed_405)
-        .layer(axum::middleware::from_fn(routes::access_control))
-        .with_state(Arc::clone(&state));
+    let app = hotarun::app(Arc::clone(&state));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)
