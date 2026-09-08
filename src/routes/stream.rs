@@ -23,12 +23,13 @@ use axum::{
 };
 use http_body::Frame;
 use tokio::sync::mpsc;
+use tokio::io::AsyncWriteExt;
 
 use crate::{
     config::{AppState, Channel, ChannelType},
     error::ApiError,
     routes::api::find_service,
-    tuner::SharedTunerManager,
+    tuner::{command::build_passthrough_command, process::{spawn_decoder_program, stop_decoder, SpawnedDecoder}, SharedTunerManager},
 };
 
 /// 確保リトライ回数 (§9: 50 x 250ms)。
@@ -290,6 +291,21 @@ struct SharedStreamBody {
     priority: i32,
 }
 
+/// BS4K の decoder 分岐。チューナーの共有は維持しつつ、各要求だけを
+/// `TLV -> decoder stdin -> decoder stdout -> HTTP` に通す。
+/// decoder の終了は HTTP body の EOF とし、Drop では必ず child を kill/wait
+/// して孤児プロセスを残さない。
+struct DecodedStreamBody {
+    rx: mpsc::Receiver<Vec<u8>>,
+    manager: SharedTunerManager,
+    index: usize,
+    generation: u64,
+    priority: i32,
+    decoder: Option<SpawnedDecoder>,
+    input_task: Option<tokio::task::JoinHandle<()>>,
+    output_task: Option<tokio::task::JoinHandle<()>>,
+}
+
 /// Per-client MPEG-TS service filter. The tuner remains shared and emits full
 /// TS; this body selects PAT, the target PMT, and the PMT's PCR/elementary PIDs.
 /// Until PAT/PMT are available, at most 8 MiB of complete packets are held.
@@ -529,6 +545,43 @@ impl Drop for ServiceStreamBody {
     }
 }
 
+impl Drop for DecodedStreamBody {
+    fn drop(&mut self) {
+        if let Some(task) = self.input_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.output_task.take() {
+            task.abort();
+        }
+        if let Some(mut decoder) = self.decoder.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(error) = stop_decoder(&mut decoder).await {
+                        tracing::warn!(error = %error, "decoder cleanup failed");
+                    }
+                });
+            }
+        }
+        let mgr = self.manager.clone();
+        let idx = self.index;
+        let generation = self.generation;
+        let priority = self.priority;
+        let hinted = mgr.release_hint_sync_lease(idx, generation, Some(priority));
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let result = if hinted {
+                    mgr.stop_if_idle(idx).await
+                } else {
+                    mgr.release_lease(idx, generation, Some(priority)).await
+                };
+                if let Err(error) = result {
+                    tracing::warn!(tuner = idx, %error, "decoded stream cleanup failed");
+                }
+            });
+        }
+    }
+}
+
 impl HttpBody for ServiceStreamBody {
     type Data = Bytes;
     type Error = std::io::Error;
@@ -664,6 +717,119 @@ impl HttpBody for SharedStreamBody {
     }
 }
 
+impl HttpBody for DecodedStreamBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.rx).poll_recv(cx) {
+            Poll::Ready(Some(chunk)) => Poll::Ready(Some(Ok(Frame::data(Bytes::from(chunk))))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+async fn spawn_decoded_body(
+    state: &Arc<AppState>,
+    idx: usize,
+    generation: u64,
+    priority: i32,
+    rx: mpsc::Receiver<Vec<u8>>,
+    template: &str,
+) -> Result<DecodedStreamBody, ApiError> {
+    let (program, args) = match build_passthrough_command(template) {
+        Ok(command) => command,
+        Err(error) => {
+            let _ = state
+                .manager
+                .release_lease(idx, generation, Some(priority))
+                .await;
+            return Err(ApiError::new(
+                500,
+                format!("invalid TLV decoder command: {error}"),
+            ));
+        }
+    };
+    let mut decoder = match spawn_decoder_program(&program, &args).await {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            let _ = state
+                .manager
+                .release_lease(idx, generation, Some(priority))
+                .await;
+            return Err(ApiError::new(
+                500,
+                format!("failed to start TLV decoder: {error}"),
+            ));
+        }
+    };
+    let Some(mut stdin) = decoder.take_stdin() else {
+        let _ = stop_decoder(&mut decoder).await;
+        let _ = state
+            .manager
+            .release_lease(idx, generation, Some(priority))
+            .await;
+        return Err(ApiError::new(500, "TLV decoder has no stdin"));
+    };
+    let Some(mut stdout) = decoder.take_stdout() else {
+        let _ = stop_decoder(&mut decoder).await;
+        let _ = state
+            .manager
+            .release_lease(idx, generation, Some(priority))
+            .await;
+        return Err(ApiError::new(500, "TLV decoder has no stdout"));
+    };
+
+    let (output_tx, output_rx) = mpsc::channel(crate::tuner::STREAM_QUEUE_LEN);
+    let input_task = tokio::spawn(async move {
+        let mut rx = rx;
+        while let Some(chunk) = rx.recv().await {
+            if stdin.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+        // Closing stdin tells a finite decoder that no more TLV is coming.
+        let _ = stdin.shutdown().await;
+    });
+    let output_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; crate::tuner::STREAM_CHUNK_SIZE];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut stdout, &mut buf).await {
+                Ok(0) => break,
+                Ok(size) => {
+                    if output_tx.send(buf[..size].to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    Ok(DecodedStreamBody {
+        rx: output_rx,
+        manager: state.manager.clone(),
+        index: idx,
+        generation,
+        priority,
+        decoder: Some(decoder),
+        input_task: Some(input_task),
+        output_task: Some(output_task),
+    })
+}
+
+fn tuner_tlv_decoder(state: &AppState, idx: usize, ct: ChannelType, decode: bool) -> Option<String> {
+    // TLVDecoder is deliberately considered only for BS4K. TS tuners keep their
+    // existing full-TS path and `decoder` field is not part of this route.
+    (ct == ChannelType::BS4K && decode)
+        .then(|| state.tuners.get(idx)?.tlv_decoder.clone())
+        .flatten()
+}
+
 /// GET /api/channels/{type}/{channel}/stream
 async fn get_channel_stream(
     state: Arc<AppState>,
@@ -673,7 +839,7 @@ async fn get_channel_stream(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     // 映像ヘッダ送出前に validation する。decode不正は 400。
-    let _decode = parse_decode(&query)?;
+    let decode = parse_decode(&query)?;
     let priority = parse_priority(&headers);
 
     // 確保 (spawn成功で即時確定・初回バイト待ちなし §8)。
@@ -681,14 +847,19 @@ async fn get_channel_stream(
     let (idx, rx, generation) = acquire_tuner(&state, ct, &channel, priority).await?;
 
     // 映像ヘッダはチューナー確保後に送出する (§11)。
-    let stream_body = SharedStreamBody {
-        rx,
-        manager: state.manager.clone(),
-        index: idx,
-        generation,
-        priority,
+    let body = if let Some(template) = tuner_tlv_decoder(&state, idx, ct, decode) {
+        // A BS4K channel with no tlvDecoder, and decode=0 even with one, is
+        // intentionally raw TLV passthrough. It must not enter the TS filter.
+        Body::new(spawn_decoded_body(&state, idx, generation, priority, rx, &template).await?)
+    } else {
+        Body::new(SharedStreamBody {
+            rx,
+            manager: state.manager.clone(),
+            index: idx,
+            generation,
+            priority,
+        })
     };
-    let body = Body::new(stream_body);
     Response::builder()
         .status(200)
         .header(header::CONTENT_TYPE, "video/MP2T")
@@ -739,8 +910,9 @@ async fn head_stream(
 }
 
 /// GET/HEAD /api/services/{id}/stream。
-/// `id` は serviceId ではなく Mirakurun の ServiceItemId。共有されたフルTSから
-/// PAT/PMTを解析し、各クライアントへ対象サービスのPIDだけを返す。
+/// `id` は serviceId ではなく Mirakurun の ServiceItemId。通常のTSは共有された
+/// フルTSからPAT/PMTを解析し、各クライアントへ対象サービスのPIDだけを返す。
+/// BS4Kは1TLV 1サービス前提のため、同じTLVをそのまま返す。
 async fn service_stream(
     State(state): State<Arc<AppState>>,
     Path(id_raw): Path<String>,
@@ -753,10 +925,31 @@ async fn service_stream(
     let Some((service, channel)) = find_service(&state.channels, id) else {
         return Err(ApiError::not_found(format!("service not found: {id}")));
     };
-    let _decode = parse_decode(&query)?;
+    let decode = parse_decode(&query)?;
     let priority = parse_priority(&headers);
-    let target_service_id = ServiceStreamBody::validate_service_id(service.serviceId)?;
     let (idx, rx, generation) = acquire_tuner(&state, channel.channel_type, &channel, priority).await?;
+    if channel.channel_type == ChannelType::BS4K {
+        // A BS4K service is one TLV stream/service by definition. Do not run
+        // the MPEG-TS PAT/PMT filter or reinterpret its bytes as TS packets.
+        let body = if let Some(template) = tuner_tlv_decoder(&state, idx, channel.channel_type, decode) {
+            Body::new(spawn_decoded_body(&state, idx, generation, priority, rx, &template).await?)
+        } else {
+            Body::new(SharedStreamBody {
+                rx,
+                manager: state.manager.clone(),
+                index: idx,
+                generation,
+                priority,
+            })
+        };
+        return Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "video/MP2T")
+            .header("X-Mirakurun-Tuner-User-ID", idx.to_string())
+            .body(body)
+            .map_err(|e| ApiError::new(500, format!("failed to build response: {e}")));
+    }
+    let target_service_id = ServiceStreamBody::validate_service_id(service.serviceId)?;
     let stream_body = ServiceStreamBody {
         rx,
         manager: state.manager.clone(),
@@ -792,8 +985,10 @@ async fn head_service_stream(
     let Some((_service, _channel)) = find_service(&state.channels, id) else {
         return Err(ApiError::not_found(format!("service not found: {id}")));
     };
-    let service_id = _service.serviceId;
-    ServiceStreamBody::validate_service_id(service_id)?;
+    let is_tlv = _channel.channel_type == ChannelType::BS4K;
+    if !is_tlv {
+        ServiceStreamBody::validate_service_id(_service.serviceId)?;
+    }
     // HEAD は既存の channel stream と同じく、検証のみでチューナーを確保しない。
     let _decode = parse_decode(&query)?;
     let _priority = parse_priority(&headers);
@@ -820,7 +1015,48 @@ pub fn router() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AppState, Channel, Tuner};
     use crate::tuner::TunerManager;
+    use std::collections::HashMap;
+
+    fn bs4k_state(tuner_command: &str, tlv_decoder: Option<&str>) -> Arc<AppState> {
+        Arc::new(AppState::from_lists(
+            vec![Channel {
+                name: "test BS4K".to_owned(),
+                channel_type: ChannelType::BS4K,
+                channel: "logical".to_owned(),
+                serviceId: Some(101),
+                tunerChannels: Some(HashMap::from([(
+                    "bs4k".to_owned(),
+                    "physical-45328".to_owned(),
+                ),])),
+                extra: HashMap::from([(String::from("networkId"), serde_json::json!(5))]),
+            }],
+            vec![Tuner {
+                name: "bs4k".to_owned(),
+                types: vec![ChannelType::BS4K],
+                command: Some(tuner_command.to_owned()),
+                tlv_decoder: tlv_decoder.map(str::to_owned),
+                decoder: None,
+                extra: HashMap::new(),
+            }],
+        ))
+    }
+
+    async fn first_body_bytes(response: Response) -> Vec<u8> {
+        let mut body = response.into_body();
+        let frame = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| {
+                std::pin::Pin::new(&mut body).poll_frame(cx)
+            }),
+        )
+        .await
+        .expect("stream body timeout")
+        .expect("stream body ended")
+        .expect("stream body error");
+        frame.into_data().expect("data frame").to_vec()
+    }
 
     #[test]
     fn channel_type_parses_case_insensitive() {
@@ -859,6 +1095,243 @@ mod tests {
         let mut bad = HeaderMap::new();
         bad.insert("x-mirakurun-priority", "foo".parse().unwrap());
         assert_eq!(parse_priority(&bad), 0);
+    }
+
+    #[tokio::test]
+    async fn bs4k_channel_passthrough_keeps_tlv_bytes_and_resolves_physical_channel() {
+        let state = bs4k_state(
+            "python3 -c \"import sys; sys.stdout.buffer.write(b'TLV-raw-45328')\"",
+            None,
+        );
+        let response = get_channel_stream(
+            Arc::clone(&state),
+            ChannelType::BS4K,
+            state.channels[0].clone(),
+            HashMap::new(),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "video/MP2T");
+        assert_eq!(response.headers()["X-Mirakurun-Tuner-User-ID"], "0");
+        assert_eq!(first_body_bytes(response).await, b"TLV-raw-45328");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(state.manager.current_channel(0).await.unwrap(), None);
+        assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn bs4k_decoder_is_a_per_request_pipe_without_shell_expansion() {
+        let state = bs4k_state(
+            "python3 -c \"import sys; sys.stdout.buffer.write(b'lower')\"",
+            Some("python3 -c \"import sys; sys.stdout.buffer.write(sys.stdin.buffer.read(5).upper())\""),
+        );
+        let response = get_channel_stream(
+            Arc::clone(&state),
+            ChannelType::BS4K,
+            state.channels[0].clone(),
+            HashMap::new(),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_body_bytes(response).await, b"LOWER");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn bs4k_decode_zero_bypasses_configured_decoder() {
+        let state = bs4k_state(
+            "python3 -c \"import sys; sys.stdout.buffer.write(b'lower')\"",
+            Some("/definitely/missing-tlv-decoder"),
+        );
+        let response = get_channel_stream(
+            Arc::clone(&state),
+            ChannelType::BS4K,
+            state.channels[0].clone(),
+            HashMap::from([(String::from("decode"), String::from("0"))]),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_body_bytes(response).await, b"lower");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn bs4k_service_returns_same_tlv_without_ts_pid_filter() {
+        let state = bs4k_state(
+            "python3 -c \"import sys; sys.stdout.buffer.write(bytes([71,0,1,84,76,86]))\"",
+            None,
+        );
+        let response = service_stream(
+            State(Arc::clone(&state)),
+            Path(String::from("500101")),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_body_bytes(response).await, [0x47, 0x00, 0x01, b'T', b'L', b'V']);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn same_bs4k_physical_channel_shares_one_tuner_process() {
+        let state = bs4k_state("python3 -c \"import time; time.sleep(30)\"", None);
+        let channel = state.channels[0].clone();
+        let (idx1, _rx1, generation1) = acquire_tuner(&state, ChannelType::BS4K, &channel, 0)
+            .await
+            .unwrap();
+        let pid = state.manager.pid(idx1).await.unwrap();
+        let (idx2, _rx2, generation2) = acquire_tuner(&state, ChannelType::BS4K, &channel, 0)
+            .await
+            .unwrap();
+        assert_eq!(idx1, idx2);
+        assert_eq!(state.manager.pid(idx2).await.unwrap(), pid);
+        assert_eq!(generation1, generation2);
+        assert_eq!(state.manager.use_count(idx1).await.unwrap(), 2);
+        state
+            .manager
+            .release_lease(idx1, generation1, Some(0))
+            .await
+            .unwrap();
+        state
+            .manager
+            .release_lease(idx2, generation2, Some(0))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(state.manager.pid(0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn decoder_spawn_failure_releases_tuner_lease() {
+        let state = bs4k_state(
+            "python3 -c \"import sys; sys.stdout.buffer.write(b'bytes')\"",
+            Some("/definitely/missing-tlv-decoder"),
+        );
+        let error = match get_channel_stream(
+            Arc::clone(&state),
+            ChannelType::BS4K,
+            state.channels[0].clone(),
+            HashMap::new(),
+            HeaderMap::new(),
+        )
+        .await
+        {
+            Ok(_) => panic!("decoder spawn must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, 500);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
+        assert_eq!(state.manager.pid(0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn bs4k_type_and_missing_channel_are_not_cross_matched() {
+        let state = bs4k_state("sleep 30", None);
+        let wrong_type = get_stream(
+            State(Arc::clone(&state)),
+            Path((String::from("BS"), String::from("logical"))),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("BS must not match a BS4K channel");
+        assert_eq!(wrong_type.code, 404);
+
+        let missing = get_stream(
+            State(state),
+            Path((String::from("BS4K"), String::from("missing"))),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("missing BS4K channel must be 404");
+        assert_eq!(missing.code, 404);
+    }
+
+    #[tokio::test]
+    async fn bs4k_priority_takeover_releases_old_physical_channel() {
+        let state = Arc::new(AppState::from_lists(
+            vec![
+                Channel {
+                    name: "first".to_owned(),
+                    channel_type: ChannelType::BS4K,
+                    channel: "first".to_owned(),
+                    serviceId: Some(101),
+                    tunerChannels: Some(HashMap::from([(
+                        "bs4k".to_owned(),
+                        "phys-a".to_owned(),
+                    )])),
+                    extra: HashMap::new(),
+                },
+                Channel {
+                    name: "second".to_owned(),
+                    channel_type: ChannelType::BS4K,
+                    channel: "second".to_owned(),
+                    serviceId: Some(102),
+                    tunerChannels: Some(HashMap::from([(
+                        "bs4k".to_owned(),
+                        "phys-b".to_owned(),
+                    )])),
+                    extra: HashMap::new(),
+                },
+            ],
+            vec![Tuner {
+                name: "bs4k".to_owned(),
+                types: vec![ChannelType::BS4K],
+                command: Some("python3 -c \"import time; time.sleep(30)\"".to_owned()),
+                tlv_decoder: None,
+                decoder: None,
+                extra: HashMap::new(),
+            }],
+        ));
+        let (_, _, old_generation) =
+            acquire_tuner(&state, ChannelType::BS4K, &state.channels[0], 10)
+                .await
+                .unwrap();
+        let (_, _, new_generation) =
+            acquire_tuner(&state, ChannelType::BS4K, &state.channels[1], 20)
+                .await
+                .unwrap();
+        assert_ne!(old_generation, new_generation);
+        assert_eq!(
+            state.manager.current_channel(0).await.unwrap().as_deref(),
+            Some("phys-b")
+        );
+        state.manager.release_lease(0, new_generation, Some(20)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(state.manager.pid(0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn decoder_exit_after_headers_is_a_clean_eof_without_lease_leak() {
+        let state = bs4k_state(
+            "python3 -c \"import sys; sys.stdout.buffer.write(b'bytes')\"",
+            Some("python3 -c \"import sys; sys.exit(1)\""),
+        );
+        let response = get_channel_stream(
+            Arc::clone(&state),
+            ChannelType::BS4K,
+            state.channels[0].clone(),
+            HashMap::new(),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(bytes.is_empty());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
+        assert_eq!(state.manager.pid(0).await.unwrap(), None);
     }
 
     fn psi_packet(pid: u16, section: &[u8]) -> [u8; 188] {

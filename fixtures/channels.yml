@@ -9,6 +9,16 @@
   channel: BS01_0
   serviceId: 101
   networkId: 5
+  tunerChannels:
+    DVB-C-0: BS4K45328
+
+- name: BS4K passthrough sample
+  type: BS4K
+  channel: BS4K45328
+  serviceId: 102
+  networkId: 5
+  tunerChannels:
+    BS4K-0: BS4K45328
 
 - name: sample GR
   type: GR

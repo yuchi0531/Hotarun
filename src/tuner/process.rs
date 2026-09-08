@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, ChildStderr, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
 /// SIGTERM 後の猶予。超過で SIGKILL (§8)。
@@ -29,6 +29,40 @@ pub struct SpawnedTuner {
     /// 起動 program 名 (即KILL判定用に保持)。
     pub program: String,
     stderr_task: Option<JoinHandle<()>>,
+}
+
+/// 起動中の per-client decoder。チューナーとは別プロセスで、stdin/stdout
+/// をストリーム配信のパイプとして使う。
+pub struct SpawnedDecoder {
+    child: Child,
+    pub pid: u32,
+    pub program: String,
+    stderr_task: Option<JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for SpawnedDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnedDecoder")
+            .field("pid", &self.pid)
+            .field("program", &self.program)
+            .finish()
+    }
+}
+
+impl SpawnedDecoder {
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+
+    pub fn take_stdout(&mut self) -> Option<ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    fn abort_stderr(&mut self) {
+        if let Some(h) = self.stderr_task.take() {
+            h.abort();
+        }
+    }
 }
 
 impl std::fmt::Debug for SpawnedTuner {
@@ -91,6 +125,43 @@ pub async fn spawn_program(
         program: program.to_owned(),
         stderr_task,
     })
+}
+
+/// `spawn(program, args)` で decoder を起動する。shell は使わず、stdin/stdout
+/// はパイプ、stderr はチューナーと同じくログ専用とする。
+pub async fn spawn_decoder_program(
+    program: &str,
+    args: &[String],
+) -> std::io::Result<SpawnedDecoder> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let pid = child.id().unwrap_or(0);
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(|stderr| spawn_stderr_logger(stderr, program.to_owned()));
+    tracing::info!(pid, program = %program, "decoder process spawned");
+    Ok(SpawnedDecoder {
+        child,
+        pid,
+        program: program.to_owned(),
+        stderr_task,
+    })
+}
+
+/// decoder の stdin/stdout が閉じた後もプロセスを孤児にしないための後始末。
+pub async fn stop_decoder(proc: &mut SpawnedDecoder) -> std::io::Result<()> {
+    if proc.child.try_wait()?.is_none() {
+        let _ = proc.child.kill().await;
+    }
+    let _ = proc.child.wait().await;
+    proc.abort_stderr();
+    Ok(())
 }
 
 /// stderr はストリームに混ぜずログのみに使う (§8)。

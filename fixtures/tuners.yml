@@ -12,3 +12,8 @@
     - BS4K
   command: recdvb --dev 0 <channel> - -
   tlvDecoder: tlvdecoder --arg1
+
+- name: BS4K-0
+  types:
+    - BS4K
+  command: recdvb --dev 1 <channel> - -
