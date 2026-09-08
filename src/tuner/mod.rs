@@ -21,8 +21,9 @@ pub use command::{
     build_passthrough_command, build_tuner_command, expand_channel_vars, shell_split,
 };
 pub use manager::{
-    MAX_CONSECUTIVE_ERRORS, RELEASE_FAST, RELEASE_SLOW, SharedTunerManager,
-    TunerManager, TunerSlot, release_wait,
+    MAX_CONSECUTIVE_ERRORS, RELEASE_FAST, RELEASE_SLOW, STREAM_CHUNK_SIZE,
+    STREAM_QUEUE_LEN, SharedTunerManager, TunerError, TunerManager, TunerSlot,
+    release_wait,
 };
 pub use process::{
     STOP_GRACE, SpawnedTuner, is_immediate_kill_program, spawn_program, stop_process,

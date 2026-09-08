@@ -67,6 +67,7 @@ impl SpawnedTuner {
 
 /// `spawn(program, args)`。stdin=null / stdout+stderr=pipe / shell不使用。
 /// 成功した時点で起動成功とみなす (初回バイト待ちなし・§8)。
+/// `kill_on_drop(true)` で管理外への孤児化を防ぐ。明示停止は `stop_process` 経由。
 pub async fn spawn_program(
     program: &str,
     args: &[String],
@@ -76,7 +77,7 @@ pub async fn spawn_program(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(false)
+        .kill_on_drop(true)
         .spawn()?;
     let pid = child.id().unwrap_or(0);
     let stderr_task = child
