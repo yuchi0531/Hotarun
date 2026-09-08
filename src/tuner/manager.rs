@@ -898,7 +898,15 @@ impl TunerManager {
                 s.start_generation = s.start_generation.wrapping_add(1);
                 s.state = TunerState::Idle;
             }
-            (s.process.as_ref().map(|_| s.process_generation), s.current_channel.clone())
+            let process_generation = s.process.as_ref().map(|_| s.process_generation);
+            if process_generation.is_some() {
+                // Reserve the grace period before releasing the slot lock. The
+                // watcher must not observe the short gap and reap the process
+                // before the timer task is installed.
+                s.idle_generation = s.idle_generation.wrapping_add(1);
+                s.idle_scheduled = true;
+            }
+            (process_generation, s.current_channel.clone())
         };
         if let Some(process_generation) = process_generation {
             if self.self_ref.get().and_then(Weak::upgrade).is_some() {
