@@ -136,6 +136,7 @@ pub struct AppState {
     pub channels: Vec<Channel>,
     pub tuners: Vec<Tuner>,
     pub manager: crate::tuner::SharedTunerManager,
+    pub decoders: std::sync::Arc<crate::tuner::DecoderRegistry>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -154,6 +155,7 @@ impl Default for AppState {
             channels: Vec::new(),
             tuners: Vec::new(),
             manager: crate::tuner::TunerManager::shared(Vec::new()),
+            decoders: crate::tuner::DecoderRegistry::new(),
         }
     }
 }
@@ -169,6 +171,7 @@ impl AppState {
             channels,
             tuners,
             manager,
+            decoders: crate::tuner::DecoderRegistry::new(),
         }
     }
 
@@ -180,6 +183,7 @@ impl AppState {
             channels,
             tuners,
             manager,
+            decoders: crate::tuner::DecoderRegistry::new(),
         }
     }
 }

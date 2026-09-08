@@ -4,12 +4,19 @@
 //! - stdout / stderr を pipe 取得し PID を保持。stderr はログのみに使う。
 //! - 停止は SIGTERM → 6秒 → SIGKILL。dvbv5系のみ即KILL。
 
-use std::process::Stdio;
+use std::{
+    collections::HashMap,
+    process::Stdio,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::task::JoinHandle;
+use tokio::{sync::Notify, task::JoinHandle};
 
 /// SIGTERM 後の猶予。超過で SIGKILL (§8)。
 pub const STOP_GRACE: Duration = Duration::from_secs(6);
@@ -38,6 +45,94 @@ pub struct SpawnedDecoder {
     pub pid: u32,
     pub program: String,
     stderr_task: Option<JoinHandle<()>>,
+}
+
+/// Application-owned registry for per-request decoders.  The HTTP body owns
+/// the pipes, while this registry retains ownership of the child itself so a
+/// server shutdown never relies on stdin reaching EOF.
+#[derive(Debug, Default)]
+pub struct DecoderRegistry {
+    next_id: AtomicU64,
+    entries: Mutex<HashMap<u64, Arc<Mutex<Option<SpawnedDecoder>>>>>,
+    shutdown: Arc<Notify>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegisteredDecoder {
+    id: u64,
+    registry: Arc<DecoderRegistry>,
+    process: Arc<Mutex<Option<SpawnedDecoder>>>,
+}
+
+impl DecoderRegistry {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn register(self: &Arc<Self>, decoder: SpawnedDecoder) -> RegisteredDecoder {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let process = Arc::new(Mutex::new(Some(decoder)));
+        self.entries.lock().expect("decoder registry poisoned").insert(id, Arc::clone(&process));
+        RegisteredDecoder { id, registry: Arc::clone(self), process }
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("decoder registry poisoned")
+            .len()
+    }
+
+    pub fn shutdown_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.shutdown)
+    }
+
+    /// Kill and reap every decoder, including ones whose HTTP body is still
+    /// blocked reading input or output.
+    pub async fn stop_all(&self) {
+        // Wake the pipe tasks first. Killing the children below then unblocks
+        // any write/read that was already in progress.
+        self.shutdown.notify_waiters();
+        let processes = self
+            .entries
+            .lock()
+            .expect("decoder registry poisoned")
+            .drain()
+            .map(|(_, process)| process)
+            .collect::<Vec<_>>();
+        for process in processes {
+            let decoder = process.lock().expect("decoder process poisoned").take();
+            if let Some(mut decoder) = decoder {
+                if let Err(error) = stop_decoder(&mut decoder).await {
+                    tracing::warn!(error = %error, "decoder shutdown failed");
+                }
+            }
+        }
+    }
+}
+
+impl RegisteredDecoder {
+    pub fn take_stdin(&self) -> Option<ChildStdin> {
+        self.process.lock().expect("decoder process poisoned").as_mut()?.take_stdin()
+    }
+
+    pub fn take_stdout(&self) -> Option<ChildStdout> {
+        self.process.lock().expect("decoder process poisoned").as_mut()?.take_stdout()
+    }
+
+    pub async fn stop(&self) {
+        let decoder = self.process.lock().expect("decoder process poisoned").take();
+        if let Some(mut decoder) = decoder {
+            if let Err(error) = stop_decoder(&mut decoder).await {
+                tracing::warn!(error = %error, "decoder cleanup failed");
+            }
+        }
+        self.registry
+            .entries
+            .lock()
+            .expect("decoder registry poisoned")
+            .remove(&self.id);
+    }
 }
 
 impl std::fmt::Debug for SpawnedDecoder {

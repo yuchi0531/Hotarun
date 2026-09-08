@@ -20,11 +20,11 @@
 use std::fmt;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc,
+    Arc, OnceLock, Weak,
 };
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
 use super::command::build_tuner_command;
@@ -36,6 +36,8 @@ use crate::config::{Channel, ChannelType, Tuner};
 pub const RELEASE_FAST: Duration = Duration::from_millis(100);
 /// 異常 release 後の再利用待ち (§8: 1000ms)。
 pub const RELEASE_SLOW: Duration = Duration::from_millis(1000);
+/// 最終クライアント切断後の物理ch維持時間 (§10)。
+pub const IDLE_GRACE: Duration = Duration::from_secs(3);
 /// FAULT になる連続失敗回数 (§8: 3連続)。
 pub const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 /// 終了監視タスクの poll 間隔。
@@ -136,6 +138,10 @@ pub struct TunerSlot {
     /// Releases clear this reservation so a last-moment disconnect cannot
     /// turn the respawn into an orphan process.
     respawn_pending: bool,
+    /// 最終lease解放後の遅延停止をslot単位で世代管理する。
+    idle_generation: u64,
+    idle_scheduled: bool,
+    idle_notify: Arc<Notify>,
 }
 
 impl TunerSlot {
@@ -162,11 +168,22 @@ impl TunerSlot {
             senders: Vec::new(),
             request_priorities: Vec::new(),
             respawn_pending: false,
+            idle_generation: 0,
+            idle_scheduled: false,
+            idle_notify: Arc::new(Notify::new()),
         }
     }
 
     fn stream_priority(&self) -> i32 {
         self.request_priorities.iter().copied().max().unwrap_or(0)
+    }
+
+    fn cancel_idle_stop(&mut self) {
+        if self.idle_scheduled {
+            self.idle_scheduled = false;
+            self.idle_generation = self.idle_generation.wrapping_add(1);
+            self.idle_notify.notify_one();
+        }
     }
 
     fn remove_request_priority(&mut self, priority: Option<i32>) {
@@ -210,6 +227,9 @@ pub struct TunerManager {
     slots: Vec<tokio::sync::Mutex<TunerSlot>>,
     shutdown: AtomicBool,
     shutdown_epoch: AtomicU64,
+    /// `new()` is retained for unit-level use; `shared()` installs this weak
+    /// reference so idle timers can own the manager without a reference cycle.
+    self_ref: OnceLock<Weak<TunerManager>>,
 }
 
 /// 将来の Scheduler / Stream Manager 用の共有型 (slot単位ロック)。
@@ -226,11 +246,14 @@ impl TunerManager {
             slots,
             shutdown: AtomicBool::new(false),
             shutdown_epoch: AtomicU64::new(0),
+            self_ref: OnceLock::new(),
         }
     }
 
     pub fn shared(tuners: Vec<Tuner>) -> SharedTunerManager {
-        Arc::new(Self::new(tuners))
+        let manager = Arc::new(Self::new(tuners));
+        let _ = manager.self_ref.set(Arc::downgrade(&manager));
+        manager
     }
 
     pub fn len(&self) -> usize {
@@ -417,6 +440,7 @@ impl TunerManager {
                 .map_err(TunerError::NotFound)?
                 .lock()
                 .await;
+            s.cancel_idle_stop();
             if self.shutdown.load(Ordering::Acquire) {
                 return Err(TunerError::Other(
                     "tuner manager is shutting down".to_owned(),
@@ -650,6 +674,7 @@ impl TunerManager {
                 && s.current_channel.as_deref() == Some(physical_channel)
                 && s.process.is_some()
             {
+                s.cancel_idle_stop();
                 s.use_count = s.use_count.saturating_add(1);
                 s.request_priorities.push(priority);
                 s.wanted_channel = Some(physical_channel.to_owned());
@@ -675,6 +700,7 @@ impl TunerManager {
                 .map_err(TunerError::NotFound)?
                 .lock()
                 .await;
+            s.cancel_idle_stop();
             if s.state != TunerState::Streaming
                 || s.process.is_none()
                 || s.current_channel.as_deref() == Some(physical_channel)
@@ -717,6 +743,7 @@ impl TunerManager {
         // process を短時間ロックで取り出し、以降はロック外で停止する。
         let mut proc: SpawnedTuner = {
             let mut s = self.slot_mutex(index)?.lock().await;
+            s.cancel_idle_stop();
             s.start_generation = s.start_generation.wrapping_add(1);
             if (s.state == TunerState::Disabled || s.state == TunerState::Fault)
                 && s.process.is_none()
@@ -763,6 +790,7 @@ impl TunerManager {
         if !s.state.is_terminal() {
             s.state = TunerState::Idle;
         }
+        s.idle_notify.notify_waiters();
         tracing::info!(index, "tuner stopped");
         Ok(())
     }
@@ -788,6 +816,9 @@ impl TunerManager {
         {
             return Ok(None);
         }
+        s.idle_scheduled = false;
+        s.idle_generation = s.idle_generation.wrapping_add(1);
+        s.idle_notify.notify_one();
         s.state = TunerState::Stopping;
         s.senders.clear();
         Ok(s.process.take())
@@ -812,6 +843,7 @@ impl TunerManager {
         if !s.state.is_terminal() {
             s.state = TunerState::Idle;
         }
+        s.idle_notify.notify_waiters();
         tracing::info!(index, "tuner stopped");
         Ok(())
     }
@@ -830,7 +862,7 @@ impl TunerManager {
     }
 
     /// 要求を1つ手放す。残存要求がなければ停止する。
-    /// `stop` の長時間 wait はロック外 (`stop` 側で実施)。
+    /// 最終要求のプロセスは3秒のidle猶予後に停止する。
     pub async fn release(&self, index: usize) -> Result<(), String> {
         let generation = self.slot_mutex(index)?.lock().await.process_generation;
         self.release_lease(index, generation, None).await
@@ -868,6 +900,12 @@ impl TunerManager {
             }
             (s.process.as_ref().map(|_| s.process_generation), s.current_channel.clone())
         };
+        if let Some(process_generation) = process_generation {
+            if self.self_ref.get().and_then(Weak::upgrade).is_some() {
+                self.schedule_idle_stop(index, process_generation, channel.as_deref()).await;
+                return Ok(());
+            }
+        }
         if let Some(proc) = self
             .take_idle_process(index, process_generation, channel.as_deref())
             .await?
@@ -997,11 +1035,70 @@ impl TunerManager {
                         s.start_generation = s.start_generation.wrapping_add(1);
                         s.state = TunerState::Idle;
                     }
+                    if s.process.is_some() && !s.idle_scheduled {
+                        s.idle_generation = s.idle_generation.wrapping_add(1);
+                        s.idle_scheduled = true;
+                    }
                 }
                 return true;
             }
         }
         false
+    }
+
+    /// Arm the §10 three-second grace timer after the last lease disappears.
+    /// Re-acquiring the same physical channel cancels it under the slot lock.
+    pub async fn schedule_idle_stop(
+        &self,
+        index: usize,
+        expected_generation: u64,
+        expected_channel: Option<&str>,
+    ) {
+        let Some(manager) = self.self_ref.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let Some(mutex) = self.slots.get(index) else { return };
+        let (idle_generation, notify) = {
+            let mut slot = mutex.lock().await;
+            if slot.use_count != 0
+                || slot.process_generation != expected_generation
+                || expected_channel.is_some_and(|channel| slot.current_channel.as_deref() != Some(channel))
+                || slot.process.is_none()
+            {
+                return;
+            }
+            if !slot.idle_scheduled {
+                slot.idle_generation = slot.idle_generation.wrapping_add(1);
+                slot.idle_scheduled = true;
+            }
+            (slot.idle_generation, Arc::clone(&slot.idle_notify))
+        };
+        let channel = expected_channel.map(str::to_owned);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep(IDLE_GRACE) => {
+                    let valid = match manager.slots.get(index) {
+                        Some(mutex) => {
+                            let slot = mutex.lock().await;
+                            slot.idle_scheduled
+                                && slot.idle_generation == idle_generation
+                                && slot.use_count == 0
+                                && slot.process_generation == expected_generation
+                                && slot.process.is_some()
+                                && channel.as_deref().is_none_or(|value| slot.current_channel.as_deref() == Some(value))
+                        }
+                        None => false,
+                    };
+                    if valid {
+                        let proc = manager.take_idle_process(index, Some(expected_generation), channel.as_deref()).await;
+                        if let Ok(Some(proc)) = proc {
+                            let _ = manager.finish_stopped_process(index, proc).await;
+                        }
+                    }
+                }
+                _ = notify.notified() => {}
+            }
+        });
     }
 
     /// 需要なし (`use_count == 0`) なら停止する。需要ありなら何もしない。
@@ -1021,6 +1118,25 @@ impl TunerManager {
             self.finish_stopped_process(index, proc).await?;
         }
         Ok(())
+    }
+
+    /// Wait until an idle slot has completed its grace-period cleanup.
+    /// This is intentionally state/Notify based so callers and tests do not
+    /// need to guess how long process reaping will take.
+    pub async fn wait_for_idle(&self, index: usize) -> Result<(), String> {
+        loop {
+            let notified = {
+                let slot = self.slot_mutex(index)?.lock().await;
+                if slot.use_count == 0
+                    && slot.process.is_none()
+                    && slot.state == TunerState::Idle
+                {
+                    return Ok(());
+                }
+                Arc::clone(&slot.idle_notify).notified_owned()
+            };
+            notified.await;
+        }
     }
 
     /// 稼働プロセスの終了をノンブロッキング確認する。
@@ -1070,6 +1186,7 @@ impl TunerManager {
                     if !s.state.is_terminal() {
                         s.state = TunerState::Idle;
                     }
+                    s.idle_notify.notify_waiters();
                 }
             }
             return Ok((true, None));
@@ -1194,11 +1311,12 @@ impl TunerManager {
                 tokio::time::sleep(WATCH_INTERVAL).await;
                 // orphan回収: 需要なしなのにプロセス残留 → 停止。
                 {
-                    let orphan = match mgr.slots.get(index) {
+                let orphan = match mgr.slots.get(index) {
                         Some(m) => {
                             let s = m.lock().await;
                             s.use_count == 0
                                 && s.wanted_channel.is_none()
+                                && !s.idle_scheduled
                                 && s.process.is_some()
                         }
                         None => false,
@@ -1584,6 +1702,25 @@ mod tests {
                 m.release(0).await.unwrap();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn final_release_keeps_process_for_three_second_grace_and_reuses_it() {
+        let m = TunerManager::shared(vec![tuner_with_command("t", Some("sleep 30"))]);
+        let (_, generation) = m.acquire_with_priority(0, "13", 0).await.unwrap();
+        let pid = m.pid(0).await.unwrap();
+        m.release_lease(0, generation, Some(0)).await.unwrap();
+        assert_eq!(m.use_count(0).await.unwrap(), 0);
+        assert_eq!(m.pid(0).await.unwrap(), pid);
+        let (_, reused_generation) = m.acquire_with_priority(0, "13", 0).await.unwrap();
+        assert_eq!(reused_generation, generation);
+        assert_eq!(m.pid(0).await.unwrap(), pid);
+        m.release_lease(0, reused_generation, Some(0)).await.unwrap();
+        tokio::time::timeout(IDLE_GRACE + Duration::from_secs(1), m.wait_for_idle(0))
+            .await
+            .expect("idle grace cleanup timeout")
+            .unwrap();
+        assert_eq!(m.pid(0).await.unwrap(), None);
     }
 
     #[tokio::test]

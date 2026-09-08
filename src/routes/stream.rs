@@ -29,7 +29,11 @@ use crate::{
     config::{AppState, Channel, ChannelType},
     error::ApiError,
     routes::api::find_service,
-    tuner::{command::build_passthrough_command, process::{spawn_decoder_program, stop_decoder, SpawnedDecoder}, SharedTunerManager},
+    tuner::{
+        command::build_passthrough_command,
+        process::{spawn_decoder_program, RegisteredDecoder},
+        SharedTunerManager,
+    },
 };
 
 /// 確保リトライ回数 (§9: 50 x 250ms)。
@@ -301,7 +305,7 @@ struct DecodedStreamBody {
     index: usize,
     generation: u64,
     priority: i32,
-    decoder: Option<SpawnedDecoder>,
+    decoder: RegisteredDecoder,
     input_task: Option<tokio::task::JoinHandle<()>>,
     output_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -533,7 +537,9 @@ impl Drop for ServiceStreamBody {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let result = if hinted {
-                    mgr.stop_if_idle(idx).await
+                    let channel = mgr.current_channel(idx).await.ok().flatten();
+                    mgr.schedule_idle_stop(idx, generation, channel.as_deref()).await;
+                    Ok(())
                 } else {
                     mgr.release_lease(idx, generation, Some(priority)).await
                 };
@@ -553,14 +559,11 @@ impl Drop for DecodedStreamBody {
         if let Some(task) = self.output_task.take() {
             task.abort();
         }
-        if let Some(mut decoder) = self.decoder.take() {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    if let Err(error) = stop_decoder(&mut decoder).await {
-                        tracing::warn!(error = %error, "decoder cleanup failed");
-                    }
-                });
-            }
+        let decoder = self.decoder.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                decoder.stop().await;
+            });
         }
         let mgr = self.manager.clone();
         let idx = self.index;
@@ -570,7 +573,9 @@ impl Drop for DecodedStreamBody {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let result = if hinted {
-                    mgr.stop_if_idle(idx).await
+                    let channel = mgr.current_channel(idx).await.ok().flatten();
+                    mgr.schedule_idle_stop(idx, generation, channel.as_deref()).await;
+                    Ok(())
                 } else {
                     mgr.release_lease(idx, generation, Some(priority)).await
                 };
@@ -683,7 +688,9 @@ impl Drop for SharedStreamBody {
             h.spawn(async move {
                 // hint済みなら二重減算を避けて停止のみ、未hintならreleaseで減算。
                 let res = if hinted {
-                    mgr.stop_if_idle(idx).await
+                    let channel = mgr.current_channel(idx).await.ok().flatten();
+                    mgr.schedule_idle_stop(idx, generation, channel.as_deref()).await;
+                    Ok(())
                 } else {
                     mgr.release_lease(idx, generation, Some(priority)).await
                 };
@@ -755,7 +762,7 @@ async fn spawn_decoded_body(
             ));
         }
     };
-    let mut decoder = match spawn_decoder_program(&program, &args).await {
+    let decoder = match spawn_decoder_program(&program, &args).await {
         Ok(decoder) => decoder,
         Err(error) => {
             let _ = state
@@ -768,8 +775,9 @@ async fn spawn_decoded_body(
             ));
         }
     };
+    let decoder = state.decoders.register(decoder);
     let Some(mut stdin) = decoder.take_stdin() else {
-        let _ = stop_decoder(&mut decoder).await;
+        decoder.stop().await;
         let _ = state
             .manager
             .release_lease(idx, generation, Some(priority))
@@ -777,7 +785,7 @@ async fn spawn_decoded_body(
         return Err(ApiError::new(500, "TLV decoder has no stdin"));
     };
     let Some(mut stdout) = decoder.take_stdout() else {
-        let _ = stop_decoder(&mut decoder).await;
+        decoder.stop().await;
         let _ = state
             .manager
             .release_lease(idx, generation, Some(priority))
@@ -786,11 +794,19 @@ async fn spawn_decoded_body(
     };
 
     let (output_tx, output_rx) = mpsc::channel(crate::tuner::STREAM_QUEUE_LEN);
+    let shutdown = state.decoders.shutdown_notifier();
+    let input_shutdown = shutdown.clone();
     let input_task = tokio::spawn(async move {
         let mut rx = rx;
-        while let Some(chunk) = rx.recv().await {
-            if stdin.write_all(&chunk).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                _ = input_shutdown.notified() => break,
+                chunk = rx.recv() => {
+                    let Some(chunk) = chunk else { break };
+                    if stdin.write_all(&chunk).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
         // Closing stdin tells a finite decoder that no more TLV is coming.
@@ -799,7 +815,11 @@ async fn spawn_decoded_body(
     let output_task = tokio::spawn(async move {
         let mut buf = vec![0u8; crate::tuner::STREAM_CHUNK_SIZE];
         loop {
-            match tokio::io::AsyncReadExt::read(&mut stdout, &mut buf).await {
+            let read = tokio::select! {
+                _ = shutdown.notified() => break,
+                read = tokio::io::AsyncReadExt::read(&mut stdout, &mut buf) => read,
+            };
+            match read {
                 Ok(0) => break,
                 Ok(size) => {
                     if output_tx.send(buf[..size].to_vec()).await.is_err() {
@@ -816,7 +836,7 @@ async fn spawn_decoded_body(
         index: idx,
         generation,
         priority,
-        decoder: Some(decoder),
+        decoder,
         input_task: Some(input_task),
         output_task: Some(output_task),
     })
@@ -925,6 +945,9 @@ async fn service_stream(
     let Some((service, channel)) = find_service(&state.channels, id) else {
         return Err(ApiError::not_found(format!("service not found: {id}")));
     };
+    let target_service_id = (channel.channel_type != ChannelType::BS4K)
+        .then(|| ServiceStreamBody::validate_service_id(service.serviceId))
+        .transpose()?;
     let decode = parse_decode(&query)?;
     let priority = parse_priority(&headers);
     let (idx, rx, generation) = acquire_tuner(&state, channel.channel_type, &channel, priority).await?;
@@ -949,14 +972,13 @@ async fn service_stream(
             .body(body)
             .map_err(|e| ApiError::new(500, format!("failed to build response: {e}")));
     }
-    let target_service_id = ServiceStreamBody::validate_service_id(service.serviceId)?;
     let stream_body = ServiceStreamBody {
         rx,
         manager: state.manager.clone(),
         index: idx,
         generation,
         priority,
-        target_service_id,
+        target_service_id: target_service_id.expect("validated non-BS4K service id"),
         input: Vec::new(),
         pending: VecDeque::new(),
         pre_ready: VecDeque::new(),
@@ -1115,7 +1137,7 @@ mod tests {
         assert_eq!(response.headers()[header::CONTENT_TYPE], "video/MP2T");
         assert_eq!(response.headers()["X-Mirakurun-Tuner-User-ID"], "0");
         assert_eq!(first_body_bytes(response).await, b"TLV-raw-45328");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        state.manager.wait_for_idle(0).await.unwrap();
         assert_eq!(state.manager.current_channel(0).await.unwrap(), None);
         assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
     }
@@ -1136,7 +1158,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first_body_bytes(response).await, b"LOWER");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        state.manager.wait_for_idle(0).await.unwrap();
         assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
     }
 
@@ -1156,7 +1178,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first_body_bytes(response).await, b"lower");
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        state.manager.wait_for_idle(0).await.unwrap();
         assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
     }
 
@@ -1175,7 +1197,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(first_body_bytes(response).await, [0x47, 0x00, 0x01, b'T', b'L', b'V']);
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        state.manager.wait_for_idle(0).await.unwrap();
         assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
     }
 
@@ -1204,7 +1226,7 @@ mod tests {
             .release_lease(idx2, generation2, Some(0))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        state.manager.wait_for_idle(0).await.unwrap();
         assert_eq!(state.manager.pid(0).await.unwrap(), None);
     }
 
@@ -1227,9 +1249,85 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code, 500);
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        state.manager.wait_for_idle(0).await.unwrap();
         assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
         assert_eq!(state.manager.pid(0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn invalid_service_id_is_rejected_before_tuner_acquisition() {
+        for service_id in [-1, 65_536] {
+            let state = Arc::new(AppState::from_lists(
+                vec![Channel {
+                    name: "invalid service".to_owned(),
+                    channel_type: ChannelType::BS,
+                    channel: "27".to_owned(),
+                    serviceId: Some(service_id),
+                    tunerChannels: None,
+                    extra: HashMap::new(),
+                }],
+                vec![Tuner {
+                    name: "tuner".to_owned(),
+                    types: vec![ChannelType::BS],
+                    command: Some("sleep 30".to_owned()),
+                    tlv_decoder: None,
+                    decoder: None,
+                    extra: HashMap::new(),
+                }],
+            ));
+            let service_item_id = crate::routes::api::service_item_id(0, service_id);
+            let error = service_stream(
+                State(Arc::clone(&state)),
+                Path(service_item_id.to_string()),
+                Query(HashMap::new()),
+                HeaderMap::new(),
+            )
+            .await
+            .expect_err("invalid service must be rejected");
+            assert_eq!(error.code, 501);
+            assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
+            assert_eq!(state.manager.pid(0).await.unwrap(), None);
+            assert_eq!(state.manager.current_channel(0).await.unwrap(), None);
+        }
+
+        let state = Arc::new(AppState::from_lists(Vec::new(), Vec::new()));
+        let error = service_stream(
+            State(Arc::clone(&state)),
+            Path(String::from("12345")),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect_err("unknown service must be rejected");
+        assert_eq!(error.code, 404);
+        assert_eq!(state.manager.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn decoder_registry_shutdown_ends_body_without_stdin_eof() {
+        let state = bs4k_state(
+            "python3 -c \"import time; time.sleep(30)\"",
+            Some("python3 -c \"import time; time.sleep(30)\""),
+        );
+        let response = get_channel_stream(
+            Arc::clone(&state),
+            ChannelType::BS4K,
+            state.channels[0].clone(),
+            HashMap::new(),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.decoders.active_count(), 1);
+        let body = response.into_body();
+        state.decoders.stop_all().await;
+        let result = tokio::time::timeout(Duration::from_secs(2), axum::body::to_bytes(body, 1024))
+            .await
+            .expect("decoder shutdown did not end HTTP body")
+            .unwrap();
+        assert!(result.is_empty());
+        assert_eq!(state.decoders.active_count(), 0);
+        assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1306,7 +1404,7 @@ mod tests {
             Some("phys-b")
         );
         state.manager.release_lease(0, new_generation, Some(20)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        state.manager.wait_for_idle(0).await.unwrap();
         assert_eq!(state.manager.pid(0).await.unwrap(), None);
     }
 
@@ -1329,7 +1427,7 @@ mod tests {
             .await
             .unwrap();
         assert!(bytes.is_empty());
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        state.manager.wait_for_idle(0).await.unwrap();
         assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
         assert_eq!(state.manager.pid(0).await.unwrap(), None);
     }

@@ -153,4 +153,5 @@ async fn shutdown_signal(state: Arc<AppState>) {
     // Close fan-out senders and stop child processes before graceful serve
     // starts waiting for long-lived stream response bodies.
     state.manager.stop_all().await;
+    state.decoders.stop_all().await;
 }
