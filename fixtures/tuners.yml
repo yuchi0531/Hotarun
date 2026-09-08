@@ -1,0 +1,14 @@
+- name: PT3-0
+  types:
+    - GR
+    - BS
+    - CS
+  command: recpt1 --device /dev/pt3video0 <channel> - -
+
+- name: DVB-C-0
+  types:
+    - GR
+    - BS
+    - BS4K
+  command: recdvb --dev 0 <channel> - -
+  tlvDecoder: tlvdecoder --arg1
