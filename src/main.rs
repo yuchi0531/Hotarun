@@ -99,10 +99,12 @@ async fn main() {
     );
 
     let app: Router = routes::config::router()
+        .merge(routes::api::router())
         .merge(routes::stream::router())
         .fallback(fallback_404)
         .method_not_allowed_fallback(method_not_allowed_405)
-        .with_state(state);
+        .layer(axum::middleware::from_fn(routes::access_control))
+        .with_state(Arc::clone(&state));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -110,13 +112,16 @@ async fn main() {
         .expect("bind failed");
     tracing::info!(%addr, "listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+        .with_graceful_shutdown(shutdown_signal(Arc::clone(&state)))
         .await
         .expect("serve failed");
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(state: Arc<AppState>) {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
             tracing::warn!(error = %e, "ctrl_c handler failed");
@@ -145,4 +150,7 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutdown signal received");
+    // Close fan-out senders and stop child processes before graceful serve
+    // starts waiting for long-lived stream response bodies.
+    state.manager.stop_all().await;
 }

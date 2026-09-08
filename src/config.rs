@@ -135,17 +135,15 @@ pub struct Tuner {
 pub struct AppState {
     pub channels: Vec<Channel>,
     pub tuners: Vec<Tuner>,
-    pub manager: std::sync::Arc<tokio::sync::Mutex<crate::tuner::TunerManager>>,
+    pub manager: crate::tuner::SharedTunerManager,
 }
 
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // async実行中でもpanicしないよう try_lock のみ使う。
-        let manager_len = self.manager.try_lock().map(|m| m.len());
         f.debug_struct("AppState")
             .field("channels", &self.channels)
             .field("tuners", &self.tuners)
-            .field("manager_len", &manager_len)
+            .field("manager_len", &self.manager.len())
             .finish()
     }
 }
@@ -155,21 +153,18 @@ impl Default for AppState {
         Self {
             channels: Vec::new(),
             tuners: Vec::new(),
-            manager: std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::tuner::TunerManager::new(Vec::new()),
-            )),
+            manager: crate::tuner::TunerManager::shared(Vec::new()),
         }
     }
 }
 
 impl AppState {
     pub fn load_from_dir(dir: &std::path::Path) -> Self {
-        let channels =
+        let mut channels =
             load_list::<Channel>(&dir.join("channels.yml"), "channels");
+        reject_duplicate_service_ids(&mut channels);
         let tuners = load_list::<Tuner>(&dir.join("tuners.yml"), "tuners");
-        let manager = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::tuner::TunerManager::new(tuners.clone()),
-        ));
+        let manager = crate::tuner::TunerManager::shared(tuners.clone());
         Self {
             channels,
             tuners,
@@ -180,15 +175,48 @@ impl AppState {
     /// テスト用: channels/tuners から state を組み立てる。
     #[cfg(test)]
     pub fn from_lists(channels: Vec<Channel>, tuners: Vec<Tuner>) -> Self {
-        let manager = std::sync::Arc::new(tokio::sync::Mutex::new(
-            crate::tuner::TunerManager::new(tuners.clone()),
-        ));
+        let manager = crate::tuner::TunerManager::shared(tuners.clone());
         Self {
             channels,
             tuners,
             manager,
         }
     }
+}
+
+fn reject_duplicate_service_ids(channels: &mut Vec<Channel>) {
+    let numeric_extra = |channel: &Channel, key: &str| {
+        channel.extra.get(key).and_then(|value| match value {
+            serde_json::Value::Number(number) => number.as_i64(),
+            serde_json::Value::String(value) => value.parse().ok(),
+            _ => None,
+        })
+    };
+    let mut counts = HashMap::new();
+    for channel in channels.iter() {
+        let Some(service_id) = channel.serviceId else { continue };
+        let network_id = numeric_extra(channel, "networkId").unwrap_or(0);
+        let id = network_id
+            .saturating_mul(100_000)
+            .saturating_add(service_id);
+        *counts.entry(id).or_insert(0usize) += 1;
+    }
+    let duplicates: std::collections::HashSet<_> = counts
+        .iter()
+        .filter_map(|(id, count)| (*count > 1).then_some(*id))
+        .collect();
+    if duplicates.is_empty() {
+        return;
+    }
+    tracing::error!(ids = ?duplicates, "duplicate ServiceItemId in channels config; rejecting colliding service records");
+    channels.retain(|channel| {
+        let Some(service_id) = channel.serviceId else { return true };
+        let network_id = numeric_extra(channel, "networkId").unwrap_or(0);
+        let id = network_id
+            .saturating_mul(100_000)
+            .saturating_add(service_id);
+        !duplicates.contains(&id)
+    });
 }
 
 /// YAML シーケンスを1件ずつパースし、不正エントリは warn + skip する (§6)。

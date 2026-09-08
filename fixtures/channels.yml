@@ -2,16 +2,19 @@
   type: BS
   channel: BS01_0
   serviceId: 101
+  networkId: 4
 
 - name: NHK BS4K
   type: BS4K
   channel: BS01_0
   serviceId: 101
+  networkId: 5
 
 - name: sample GR
   type: GR
   channel: "27"
   serviceId: 1024
+  networkId: 1
   tunerChannels:
     DVB-C-0: "13"
     DVB-C-1: "27"
