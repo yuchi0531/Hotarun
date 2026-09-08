@@ -256,3 +256,36 @@ async fn real_http_router_covers_pat_filter_fanout_priority_takeover_release_and
     let response = open(failed, Method::GET, "/api/channels/BS4K/logical/stream").await;
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+#[tokio::test]
+async fn real_http_router_respawns_a_stream_and_keeps_the_body_lease_valid() {
+    let state = one_tuner_state(&format!("{} respawn", fixture()));
+    let response = open(Arc::clone(&state), Method::GET, "/api/channels/BS4K/logical/stream").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)),
+    )
+    .await
+    .expect("initial HTTP stream frame timeout")
+    .expect("initial HTTP stream ended")
+    .expect("initial HTTP stream error")
+    .into_data()
+    .unwrap();
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)),
+    )
+    .await
+    .expect("respawned HTTP stream frame timeout")
+    .expect("respawned HTTP stream ended")
+    .expect("respawned HTTP stream error")
+    .into_data()
+    .unwrap();
+    assert_eq!(first.as_ref(), b"respawn-data");
+    assert_eq!(second.as_ref(), b"respawn-data");
+    state.manager.stop_all().await;
+    let _ = to_bytes(body, 16 * 1024).await.unwrap();
+    assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
+}
