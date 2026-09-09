@@ -46,6 +46,14 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu,armv7-unknown-linux-gnueabihf
 
+      - name: Ensure GitHub Release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view '${{ steps.release.outputs.tag }}' --repo '${{ github.repository }}' >/dev/null 2>&1; then
+            gh release create '${{ steps.release.outputs.tag }}' --verify-tag --title '${{ steps.release.outputs.tag }}' --generate-notes --repo '${{ github.repository }}'
+          fi
+
       - name: Build release binaries
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
