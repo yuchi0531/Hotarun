@@ -33,6 +33,24 @@ Hotarun自身は録画、EPG収集、映像変換を行いません。
 
 バージョンは [SemVer](https://semver.org/) に準拠します。リリースタグは `vX.Y.Z` 形式です。現在のバージョンは `0.0.1` です。
 
+Linux向けのリリースバイナリは、リリース番号によらない固定ファイル名で配布します。
+
+| 対応環境 | バイナリ | SHA-256 |
+|---|---|---|
+| Linux x86_64 | [`hotarun-linux-x86_64`](https://github.com/yuchi0531/Hotarun/releases/latest/download/hotarun-linux-x86_64) | [`hotarun-linux-x86_64.sha256`](https://github.com/yuchi0531/Hotarun/releases/latest/download/hotarun-linux-x86_64.sha256) |
+| Linux ARM32 (ARMv7 hard-float) | [`hotarun-linux-arm32`](https://github.com/yuchi0531/Hotarun/releases/latest/download/hotarun-linux-arm32) | [`hotarun-linux-arm32.sha256`](https://github.com/yuchi0531/Hotarun/releases/latest/download/hotarun-linux-arm32.sha256) |
+
+例えばx86_64版は次のように取得・検証できます。
+
+```sh
+curl -fL -o hotarun-linux-x86_64 https://github.com/yuchi0531/Hotarun/releases/latest/download/hotarun-linux-x86_64
+curl -fL -o hotarun-linux-x86_64.sha256 https://github.com/yuchi0531/Hotarun/releases/latest/download/hotarun-linux-x86_64.sha256
+sha256sum -c hotarun-linux-x86_64.sha256
+chmod +x hotarun-linux-x86_64
+```
+
+`v*`タグのリリースは [.github/workflows/release.yml](.github/workflows/release.yml) でx86_64とARM32をビルドし、上記の固定名assetをGitHub Releaseへ追加・置換します。
+
 ## 対応放送
 
 | Type | 配信形式 | スキャン |

@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and upload
+        required: true
+        default: v0.0.1
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Select release tag
+        id: release
+        shell: bash
+        run: |
+          tag='${{ inputs.tag }}'
+          if [[ -z "$tag" ]]; then
+            tag="$GITHUB_REF_NAME"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+
+      - name: Install ARM32 cross compiler
+        run: sudo apt-get update && sudo apt-get install --yes gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+
+      - name: Install Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,armv7-unknown-linux-gnueabihf
+
+      - name: Build release binaries
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          cargo build --locked --release --target x86_64-unknown-linux-gnu
+          cargo build --locked --release --target armv7-unknown-linux-gnueabihf
+          install -m 0755 target/x86_64-unknown-linux-gnu/release/hotarun staging/hotarun-linux-x86_64
+          install -m 0755 target/armv7-unknown-linux-gnueabihf/release/hotarun staging/hotarun-linux-arm32
+          (cd staging && sha256sum hotarun-linux-x86_64 > hotarun-linux-x86_64.sha256)
+          (cd staging && sha256sum hotarun-linux-arm32 > hotarun-linux-arm32.sha256)
+          file staging/hotarun-linux-x86_64 staging/hotarun-linux-arm32
+          test -x staging/hotarun-linux-x86_64
+          test -x staging/hotarun-linux-arm32
+
+      - name: Upload fixed-name assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload '${{ steps.release.outputs.tag }}' staging/hotarun-linux-x86_64 staging/hotarun-linux-x86_64.sha256 staging/hotarun-linux-arm32 staging/hotarun-linux-arm32.sha256 --clobber --repo '${{ github.repository }}'
