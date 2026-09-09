@@ -1,77 +1,124 @@
 # Hotarun
 
-Rust/Axumで実装した、Mirakurun互換の軽量チューナーサーバーです。
-外部チューナープログラムの標準出力をHTTPで配信します。
+Rust/Axumで実装した、Mirakurun/MMirakurun互換の軽量チューナーサーバーです。
+チューナープログラムの標準出力を受け取り、HTTPストリームとして配信します。
+Hotarun自身は録画、EPG収集、映像変換を行いません。
 
 ## 概要
 
-現在の実装では、次の機能を提供します。
+実装済みの主な機能は次のとおりです。
 
-- `channels.yml` と `tuners.yml` の読み込み
-- GR / BS / CS のMPEG-2 TS配信
-- BS4KのTLV配信
-- チューナーの自動選択
-- 同じ物理チャンネルへのストリーム共有とfan-out
-- `X-Mirakurun-Priority` による優先度の高い要求への切り替え
-- 通常のTSストリームに対するservice単位のPAT / PMTフィルタリング
-- 1物理チャンネル内の複数TSサービス集約とServiceItemId列挙
-- BS4Kの `tlvDecoder` を使用した要求ごとの外部decoder pipe
-- Mirakurun形式の設定・一覧・ストリームAPI
-- LAN向けのアクセス制御とOrigin / Referer検査
-- `server.yml` の port / unix socket / CIDR / logLevel 読み込み
-- 管理APIは既定でloopbackのみ。管理LANへ広げる場合は `adminCIDR` を明示する。
+- `channels.yml`、`tuners.yml`、`server.yml` のYAML設定
+- GR / BS / CS / SKYのMPEG-2 TS配信
+- BS4KのTLV/MMT配信
+- チューナーの自動選択、物理チャンネルのチューナー別マッピング
+- 同じ物理チャンネルのストリーム共有とノンブロッキングfan-out
+- `X-Mirakurun-Priority` による優先度の高い要求へのtakeover
+- TS service streamのPAT / PMT / PCR / elementary PIDフィルタリング
+- 1物理チャンネル内の複数サービス検出と`ServiceItemId`列挙
+- TS用`decoder`、BS4K用`tlvDecoder`のクライアント単位の外部プロセス
+- Mirakurun互換を目指した設定・一覧・状態・ストリームAPI
 - チャンネルスキャン（GR / BS / CS / BS4K、同期・非同期・進捗・中止・dryRun）
-- スキャンでのPAT / NIT / SDTサービス検出（BS4KはTLV-NIT actual + MMT PLT/SDT actual）
-- 設定保存APIと再起動要求API（保存後の反映は再起動）
-- 素HTML/CSS/JavaScriptのDashboard / Tuners / Channels / Scan / Configuration
-- BonDriver_Mirakurun向けHTTPストリームアダプター（`/api/bonDriver/...`）
+- 設定保存APIと再起動要求API
+- CIDR、管理用CIDR、Origin / Referer検査、CORS
+- Unix socket、peer credential検証、socket mode `0660`
+- ログファイル、管理イベント履歴、health / status API
+- 素のHTML/CSS/JavaScriptによるWeb UI
+- systemd用のhardening例
+- BonDriver_Mirakurun向けHTTPストリームアダプター
 
-Hotarun自身は録画や映像変換を行いません。チューナーと、必要に応じて外部decoderを起動・管理し、ストリームを中継します。
+設計上の基準は [SPECIFICATION.md](SPECIFICATION.md) です。このREADMEは現在のコードの実装状況を説明するもので、`SPECIFICATION.md`は変更していません。
 
-### 対象外
+## 対応放送
 
-- EPG収集、番組データベース、録画管理
-- HLS / DASH、DLNA、トランスコード
-- BonDriverやRivarunとの実機接続検証
+| Type | 配信形式 | スキャン |
+|---|---|---|
+| `GR` | MPEG-2 TS | 対応 |
+| `BS` | MPEG-2 TS | 対応 |
+| `CS` | MPEG-2 TS | 対応 |
+| `SKY` | MPEG-2 TS | 配信のみ |
+| `BS4K` | TLV/MMT | 対応 |
 
-詳細な設計上の方針は [SPECIFICATION.md](SPECIFICATION.md) を参照してください。
+## アーキテクチャ
+
+```text
+HTTP client / Rivarun / HTTP adapter
+                 │
+                 ▼
+          Axum HTTP API / Web UI
+                 │
+                 ▼
+    scheduler・チューナー選択・scan lease
+                 │
+                 ▼
+          Tuner Manager
+                 │
+                 ▼
+      外部チューナープログラム
+                 │ stdout
+                 ▼
+       Stream Manager / fan-out
+          │                  │
+          │                  └─ per-client decoder
+          └─ TS filter       └─ BS4K TLV decoder
+                 │
+                 ▼
+             HTTP response
+```
+
+- 設定は起動時に読み込み、メモリ上のスナップショットとして使用します。
+- 同一物理チャンネルの要求は、可能な場合に同じチューナープロセスを共有します。
+- チューナーstdoutはクライアントごとのbounded queueへfan-outします。遅いクライアントがいても他のクライアントを待たせず、queueが満杯のチャンクはそのクライアント向けに破棄します。
+- 最後のクライアント切断後は3秒の猶予を置いてチューナーを停止します。
+- 外部コマンドはshellを介さず、プログラムと引数に分割して直接起動します。
 
 ## 必要環境
 
-- Rust toolchain（`cargo`）
-- Linuxなど、Rustと外部チューナープログラムを実行できる環境
-- 使用するチューナープログラム（例: `recpt1`、`recdvb`）
-- BS4Kでdecoderを使う場合は、`tlvDecoder` に指定する外部プログラム
+- Rust 1.85以降のtoolchain（`cargo`）
+- Rustバイナリと外部チューナープログラムを実行できるLinux等の環境
+- 標準出力へストリームを書き出すチューナープログラム（例: `recpt1`、`recdvb`）
+- BS4Kでデコードする場合は、`tlvDecoder`に指定する外部プログラム
 
-外部チューナープログラムは、標準出力へストリームを書き出す必要があります。Hotarunはshellを介さず、プログラムと引数を直接起動します。
+実機チューナーのデバイスアクセス権は、Hotarunを起動するユーザーに付与してください。
 
-## ビルド
+## ビルドと起動
 
 ```sh
 cargo build --release
+./target/release/hotarun
 ```
 
-生成されるバイナリは `target/release/hotarun` です。
+既定値は次のとおりです。
+
+| 項目 | 既定値 |
+|---|---|
+| 設定ディレクトリ | `/etc/hotarun` |
+| TCPポート | `40772` |
+| ログファイル | `/var/log/hotarun/hotarun.log` |
+
+設定ディレクトリとTCPポートは、コマンドライン引数または環境変数で変更できます。コマンドライン引数が優先されます。
+
+```sh
+./target/release/hotarun \
+  --config-dir ./fixtures \
+  --port 40772
+```
+
+- `--port`は`-p`でも指定できます。
+- `HOTARUN_CONFIG_DIR`は設定ディレクトリの初期値です。
+- `PORT`はTCPポートの初期値です。
+- `/var/log/hotarun`を作成できない場合、tracingの出力は標準エラーへフォールバックします。
+- 設定ファイルの変更はホットリロードされません。保存後に再起動してください。
+
+`server.yml`で`socket`を指定した場合はTCPではなくUnix socketで待ち受けます。
 
 ## 設定
 
-既定の設定ディレクトリは `/etc/hotarun` です。起動時に次のファイルを読み込みます。
-
-```text
-/etc/hotarun/channels.yml
-/etc/hotarun/tuners.yml
-```
-
-運用ログは `/var/log/hotarun/hotarun.log` に追記します（ディレクトリを
-作成できない場合は標準エラーへフォールバックします）。
-
-設定は起動時に読み込まれ、ホットリロードされません。ファイルを変更した場合は再起動してください。ファイルがない場合や、型が不正なエントリがある場合は警告を出して空のリスト、または有効なエントリだけで起動します。
-
-サンプルは [fixtures/channels.yml](fixtures/channels.yml) と [fixtures/tuners.yml](fixtures/tuners.yml) にあります。
+サンプルは [fixtures/channels.yml](fixtures/channels.yml)、[fixtures/tuners.yml](fixtures/tuners.yml)、[fixtures/server.yml](fixtures/server.yml) にあります。
 
 ### `channels.yml`
 
-`name`、`type`、`channel` が必須です。`type` は `GR`、`BS`、`CS`、`SKY`、`BS4K` のいずれかです。`channel` は文字列として扱われます。
+`name`、`type`、`channel`が必須です。`type`は`GR`、`BS`、`CS`、`SKY`、`BS4K`のいずれかです。`channel`は文字列として扱います。
 
 ```yaml
 - name: NHK BS
@@ -95,32 +142,13 @@ cargo build --release
   networkId: 1
 ```
 
-`tunerChannels` を指定すると、チューナー名ごとに物理チャンネルを上書きできます。指定がなければ `channel` の値を使用します。
+`tunerChannels`を指定すると、`tuner.name`ごとに物理チャンネルを上書きします。指定がなければ`channel`を使用します。
 
-### `server.yml`
-
-`channels.yml`、`tuners.yml` と同じ設定ディレクトリに置きます。省略時はHTTP
-40772番ポート、LAN向けCIDR既定値です。
-
-```yaml
-port: 40772
-# socket: /run/hotarun.sock
-CIDR:
-  - 192.168.0.0/16
-  - 10.0.0.0/8
-logLevel: 1
-maxLogHistory: 1000
-# adminCIDR: [192.168.1.0/24]
-```
-
-`socket` を指定するとTCPポートの代わりにUnix socketで待ち受けます。CIDRを
-指定した場合はその範囲だけを許可します。設定の型・範囲が不正な場合は安全な
-既定値で起動します。`/api/config/*` の保存・再起動APIは、通常のストリーム
-CIDRとは別に、`adminCIDR` がなければloopbackだけを許可します。
+スキャンで複数サービスを検出した場合は、同じ`(type, channel)`のレコードに主サービスを`serviceId` / `name`として保存し、追加サービスを拡張フィールド`services`に保存します。
 
 ### `tuners.yml`
 
-`name` と `types` が必須です。ストリーム要求を処理するには `command` も必要です。
+`name`と`types`が必須です。ストリーム配信とスキャンには`command`が必要です。
 
 ```yaml
 - name: PT3-0
@@ -137,68 +165,81 @@ CIDRとは別に、`adminCIDR` がなければloopbackだけを許可します�
     - BS4K
   command: recdvb --dev 0 <channel> - -
   tlvDecoder: tlvdecoder --arg1
+  decoder: cas-decoder --arg1
 ```
 
-チューナーの `command` にある `<channel>` は、`tunerChannels` の解決後に物理チャンネルへ置換されます。未知の `<...>` は空文字になります。引用符とバックスラッシュによる引数分割には対応しますが、shellは起動しません。
+- `command`の`<channel>`は、`tunerChannels`解決後の物理チャンネルへ置換します。
+- 未知の`<...>`は空文字になります。
+- 引用符とバックスラッシュによる引数分割に対応しますが、shellは起動しません。
+- `tlvDecoder`は`BS4K`専用です。`decoder`はGR / BS / CS / SKYのTS用です。
+- `tlvDecoder`と`decoder`には変数展開を行いません。指定した文字列を引数分割して直接起動します。
 
-`tlvDecoder` はBS4K専用です。`decoder` はGR / BS / CS / SKYのCAS等の
-per-client decoderです。どちらも変数展開を行わず、指定されたプログラムを
-直接起動します。
+### `server.yml`
 
-## 起動
+`channels.yml`、`tuners.yml`と同じ設定ディレクトリに置きます。
 
-```sh
-./target/release/hotarun
+```yaml
+port: 40772
+# socket: /run/hotarun/hotarun.sock
+CIDR:
+  - 192.168.0.0/16
+  - 10.0.0.0/8
+adminCIDR:
+  - 192.168.1.0/24
+logLevel: 1
+maxLogHistory: 1000
 ```
 
-設定ディレクトリとポートは起動引数で変更できます。
+- `port`の既定値は`40772`です。`socket`を指定するとUnix socketを使用します。
+- `CIDR`を省略した場合、TCP接続はloopback、private、link-localアドレスのみ許可します。指定した場合は指定範囲だけを許可します。
+- `/api/config/*`の管理APIは、`adminCIDR`を省略するとloopbackだけを許可します。管理LANから使う場合だけ`adminCIDR`を明示してください。
+- `logLevel`は`-1`から`3`です。`maxLogHistory`は`/api/log`で返す管理イベント履歴の上限です。
+- Unix socketはbind時にmode `0660`となり、要求時にpeerのUIDまたはGIDがHotarunプロセスの有効UID/GIDと一致することを確認します。
 
-```sh
-./target/release/hotarun \
-  --config-dir ./fixtures \
-  --port 40772
-```
+設定保存APIは一時ファイルを経由してYAMLを置換しますが、実行中の設定は更新しません。保存後に再起動が必要です。
 
-`--port` は `-p` と書くこともできます。既定値は次のとおりです。
+## BS4K / TLV / MMT
 
-| 項目 | 既定値 |
+`type: BS4K`はMPEG-2 TSとして解析せず、TLVストリームとして扱います。
+
+| 条件 | 動作 |
 |---|---|
-| 設定ディレクトリ | `/etc/hotarun` |
-| HTTPポート | `40772` |
+| `tlvDecoder`未指定 | TLVをそのままHTTPへ中継 |
+| `tlvDecoder`指定、`decode=1`（省略時の既定） | 要求ごとに`TLV → tlvDecoder stdin → tlvDecoder stdout → HTTP`で中継 |
+| `decode=0` | `tlvDecoder`の指定にかかわらず、TLVをそのまま中継 |
 
-環境変数 `HOTARUN_CONFIG_DIR` と `PORT` でも初期値を指定できます。コマンドライン引数が指定された場合は引数が優先されます。
+いずれの場合もレスポンスの`Content-Type`は正確に`video/MP2T`です。BS4Kのchannel stream、service streamでは、TSのPAT / PMT / PIDフィルタリングを行いません。BS4K service streamは、対応するTLVストリームをそのまま返します。
 
-サーバーは `0.0.0.0` で待ち受けます。実際のチューナーを使う場合は、外部コマンドが実行可能で、対象デバイスへアクセスできるユーザーで起動してください。
+通常のTSでは、`decoder`を指定して`decode=1`にすると次のように動作します。
 
-## BS4K / TLV
+- channel stream: フルTSをdecoder stdinへ渡し、decoder stdoutをHTTPへ中継
+- service stream: 対象サービスのPAT / PMT / PCR / elementary PIDだけをdecoder stdinへ渡し、decoder stdoutをHTTPへ中継
+- `decode=0`: 外部decoderを使わず、channel streamはフルTS、service streamは通常のservice filter結果を返す
 
-`type: BS4K` のチャンネルは、通常のMPEG-2 TSとしてPAT / PMTフィルタリングせず、TLVストリームとして扱います。
+BS4Kのサービス検出は、fixtureとテストで次を実装しています。
 
-- `tlvDecoder` 未指定: TLVをそのままクライアントへ配信
-- `tlvDecoder` 指定かつ `decode=1`（既定）: 要求ごとに `TLV -> tlvDecoder stdin -> tlvDecoder stdout -> HTTP` として配信
-- `decode=0`: `tlvDecoder` の指定があってもdecoderを通さず、TLVをそのまま配信
-- TSも `decoder` 指定時は、service streamでは対象サービスのPAT / PMT / PIDだけを
-  decoder stdinへ送り、decoder stdoutをHTTPへ中継します。channel streamは従来通り
-  フルTSをdecoderへ渡します。`decode=0` はraw bypassです。
-- いずれの場合もレスポンスの `Content-Type` は `video/MP2T`
-- BS4Kのservice streamでもTSのPAT / PMTフィルタリングは行わない
-
-スキャンで同一物理チャンネルから複数サービスを検出した場合、`channels.yml` には
-1つの `(type, channel)` レコードを保存し、主サービスは通常の `serviceId` / `name`、
-追加サービスは拡張フィールド `services` に保持します。`/api/services` と
-`/api/services/:id` は両方を列挙・取得できます。
-
-decoderはクライアントごとに起動されます。一方、元のチューナーストリームは通常のストリームと同じく共有されます。
+- actual TLV-NIT
+- actual MMT PLT / SDT
+- MMTメッセージのfragment再構成
+- packet sequenceを使ったinterleave処理
+- 複数section、複数serviceの集約
+- NIT、PLT、SDTの整合性確認
 
 ## HTTP API
 
-設定・一覧APIはGETです。ストリームAPIはGETとHEADに対応します。
+成功するストリームレスポンスは`Content-Type: video/MP2T`と`X-Mirakurun-Tuner-User-ID`を返します。`HEAD`はチューナーを確保せず、空のレスポンスを返します。
 
-### 設定・一覧
+### 一覧・状態
 
 ```text
+GET /api/version
+GET /api/status
+GET /api/health
+GET /api/log
+
 GET /api/config/channels
 GET /api/config/tuners
+GET /api/config/server
 
 GET /api/channels
 GET /api/channels/:type/:channel
@@ -208,54 +249,27 @@ GET /api/tuners
 GET /api/tuners/:index
 ```
 
-`/api/channels` は `type`、`channel`、`name` で絞り込めます。`/api/services` は `serviceId`、`networkId`、`type`、`name`、`channel.type`、`channel.channel` で絞り込めます。
-
-serviceの `:id` は `serviceId` 単体ではありません。`networkId * 100000 + serviceId` で作られるMirakurunのServiceItemIdです。
-
-### バージョン・状態
-
-```text
-GET /api/version
-GET /api/status
-GET /api/health
-GET /api/log
-```
-
-`/api/version` はパッケージのバージョンを `current` と `latest` に返します。`/api/status` はサーバー状態、プロセスID、チューナー数、利用可能数、アクティブストリーム数などを返します。
-`/api/log` は設定保存・再起動要求などの管理イベントを、`server.yml` の
-`maxLogHistory` 件まで返します。外部チューナーのstderrなど通常の診断ログは
-tracingの出力先に送られます。
+- `/api/channels`は`type`、`channel`、`name`で絞り込めます。
+- `/api/services`は`serviceId`、`networkId`、`type`、`name`、`channel.type`、`channel.channel`で絞り込めます。
+- serviceの`:id`は`serviceId`単体ではありません。`networkId * 100000 + serviceId`で作るMirakurunの`ServiceItemId`です。
+- `/api/status`はサーバー、チューナー、アクティブストリーム、スキャンの状態を返します。
+- `/api/log`は`maxLogHistory`件までの設定保存・再起動・スキャン失敗などの管理イベントを返します。外部プロセスのstderr等はtracingの出力先へ送ります。
 
 ### ストリーム
 
 ```text
 GET  /api/channels/:type/:channel/stream
 HEAD /api/channels/:type/:channel/stream
-
 GET  /api/services/:id/stream
 HEAD /api/services/:id/stream
 
-GET/PUT/DELETE /api/config/channels/scan
-POST /api/config/restart
-PUT /api/config/channels
-PUT /api/config/tuners
-GET/PUT /api/config/server
-
-管理画面は `/ui/` です。スキャンAPIは `type=GR|BS|CS|BS4K`、`dryRun=true`、
-`refresh=false`、`async=true` をqueryで受け付けます。同期スキャンは完了後に
-結果を返し、非同期スキャンは202を返します。
+GET  /api/bonDriver/channels/:type/:channel/stream
+HEAD /api/bonDriver/channels/:type/:channel/stream
 ```
 
-クエリパラメータ `decode` は `0` または `1` のみ受け付けます。省略時は `1` です。`decode=0` はBS4Kの外部decoderを回避する指定で、通常のTS経路のPAT / PMTフィルタリングを無効にする指定ではありません。
+ストリームqueryの`decode`は`0`または`1`だけを受け付け、省略時は`1`です。`X-Mirakurun-Priority`を指定すると、空きがない場合に、より高い優先度の要求が別チャンネルのストリームをtakeoverできます。
 
-要求ヘッダー `X-Mirakurun-Priority` を指定すると、より高い優先度の要求が別チャンネルのストリームを引き継げます。成功時は次のヘッダーを返します。
-
-```text
-Content-Type: video/MP2T
-X-Mirakurun-Tuner-User-ID: <tuner index>
-```
-
-HEADはチューナーを確保せず、空のレスポンスを返します。エラーは次の形式のJSONです。
+エラーは次のJSON形式です。
 
 ```json
 {
@@ -265,41 +279,129 @@ HEADはチューナーを確保せず、空のレスポンスを返します。�
 }
 ```
 
-## テスト
+未実装のパスは404、対応していないメソッドは405、チューナー枯渇は503を返します。
 
-単体テストとHTTP統合テストを実行します。
+### 設定・再起動
 
-```sh
-cargo test
+```text
+PUT/POST /api/config/channels
+PUT      /api/config/tuners
+GET/PUT  /api/config/server
+POST     /api/config/restart
 ```
 
-ビルドのみ確認する場合は次を実行します。
+設定APIは管理用エンドポイントです。保存成功時は`restartRequired: true`を返します。`/api/config/restart`は再起動要求を受け付け、daemonのgraceful shutdown後に設定を読み直します。
 
-```sh
-cargo build
+## チャンネルスキャン
+
+```text
+PUT    /api/config/channels/scan
+GET    /api/config/channels/scan
+DELETE /api/config/channels/scan
 ```
 
-テストにはRust製の `hotarun-test-fixture` バイナリを使用するため、実チューナーや実機のBS4K/TLV decoderは必要ありません。
+`PUT`のqueryで次を指定できます。
+
+| query | 既定値 | 説明 |
+|---|---:|---|
+| `type` | 全種類 | `GR`、`BS`、`CS`、`BS4K` |
+| `dryRun` | `false` | `channels.yml`へ保存しない |
+| `refresh` | `true` | 対象typeの未検出チャンネルを削除。`false`は既存を引き継ぐ |
+| `async` | `false` | `true`なら202を返してバックグラウンド実行 |
+| `serviceType` | なし | 検出サービス種別で絞り込む |
+
+- 同期スキャンは完了後に`200 text/plain; charset=utf-8`でYAMLを返します。
+- 非同期スキャンは`202`を返し、GETで`status`、`progress`、`scanned`、`total`、`channels`、`error`を確認します。
+- DELETEは実行中スキャンを中止し、成功時は`206`を返します。
+- 1論理チャンネルのタイムアウトは20秒、全体のタイムアウトは30分です。
+- TSはPAT、actual NIT、actual SDTが揃うまで有効なサービスとして保存しません。
+- BS4Kはactual TLV-NITとMMT PLT / SDTを検出し、fixtureでfragment、interleave、複数serviceを検証しています。
+- スキャンは既存の共有ストリームを利用でき、スキャンが所有していないチューナープロセスを停止しません。
+- 保存後の反映には再起動が必要です。
+
+## Web UI
+
+管理画面は `/ui/` です。次の画面を含みます。
+
+- Dashboard: server status、tuner status、active streams
+- Tuners: チューナー一覧と状態
+- Channels: チャンネル一覧
+- Scan: GR / BS / CS / BS4Kの非同期スキャン、進捗表示、中止
+- Configuration: `channels`、`tuners`、`server`の表示・保存
+
+UIはRustバイナリに埋め込んだ素のHTML/CSS/JavaScriptです。設定保存やスキャンはHTTP APIを呼び出します。
+
+## systemd
+
+[fixtures/hotarun.service.example](fixtures/hotarun.service.example)にサービス例があります。
+
+```sh
+install -Dm755 target/release/hotarun /usr/bin/hotarun
+install -d -o hotarun -g hotarun /etc/hotarun /var/log/hotarun
+cp fixtures/channels.yml fixtures/tuners.yml fixtures/server.yml /etc/hotarun/
+cp fixtures/hotarun.service.example /etc/systemd/system/hotarun.service
+systemctl daemon-reload
+systemctl enable --now hotarun
+```
+
+実運用では、fixtureのチューナーコマンドを実際の環境に合わせて変更してください。サービス例は`NoNewPrivileges`、`PrivateTmp`、`ProtectSystem`、`ProtectHome`を有効にし、必要な書き込み先だけを`ReadWritePaths`に指定しています。
 
 ## セキュリティとネットワーク
 
-Hotarunには認証機能がありません。サーバーは全インターフェースで待ち受けますが、TCP接続元はループバック、プライベートアドレス、リンクローカルアドレスに制限されます。OriginまたはRefererが送られた場合は、リクエストのHostと一致する必要があります。
+Hotarunには認証機能がありません。TCPリスナーは`0.0.0.0`で待ち受けますが、接続元は既定でloopback / private / link-localに制限されます。`CIDR`を指定した場合はその範囲だけを許可します。
 
-したがって、インターネットへ直接公開しないでください。ファイアウォールなどでもLAN内の必要なクライアントだけに制限してください。`command` と `tlvDecoder` は設定ファイルから外部プロセスを起動するため、信頼できる管理者だけが設定ファイルを書き換えられるようにしてください。
+- 管理API（`/api/config/*`）は、既定ではloopbackだけを許可します。管理LANへ公開する場合は`adminCIDR`を明示してください。
+- `Origin`はHTTP scheme、host、portが`Host`と一致する場合だけ許可します。
+- `Referer`がある場合はhostが`Host`と一致する必要があります。
+- CORSは許可済みのOriginに対してだけ応答ヘッダーを付けます。
+- Unix socketではmode `0660`とpeerのUID/GID検証を併用します。
+- `command`、`decoder`、`tlvDecoder`は設定から外部プロセスを起動します。設定ファイルを信頼できる管理者だけが変更できるようにしてください。
+- インターネットへ直接公開しないでください。必要に応じてファイアウォールやリバースプロキシで接続元を制限してください。
+
+## テストと検証状況
+
+次の検証を実施済みです。
+
+```sh
+/home/yuchi0531/.cargo/bin/cargo build
+/home/yuchi0531/.cargo/bin/cargo check --all-targets
+/home/yuchi0531/.cargo/bin/cargo test --no-fail-fast
+git diff --check
+```
+
+- `cargo test --no-fail-fast`: **112 passed**
+- HTTP API、ストリーム共有、priority takeover、decoder、scan lifecycle、設定保存、Unix socket、CIDR/CORS、Web UIを統合テストで検証
+- Rust製`hotarun-test-fixture`でTS/TLV、scan入力、decoder入出力を再現
+- BS4K MMT/TLV discoveryはfixture/testでactual TLV-NIT、MMT PLT/SDT、fragment/interleave、複数serviceを検証
 
 ## 既知の制限
 
-- 実機チューナーでのGR / BS / CS配信は、このリポジトリの自動テスト対象ではありません。
-- 実機BS4K/TLVチューナーと外部 `tlvDecoder` の接続は未確認です。
-- 設定変更はホットリロードされません。反映には再起動が必要です。
-- EPG、録画機能はありません。
-- スキャンの実機チューナー動作とBonDriverのWindows ABI接続は未確認です。
-- BonDriverの仕様書にはwire protocol/endpointが定義されていないため、HotarunはHTTPストリームアダプターを提供し、ネイティブWindows DLL ABIは実装対象外です。
-- HTTP APIはMirakurun互換を目指した最小実装です。未実装のパスは404、対応していないメソッドは405を返します。
-- BonDriverはSPECIFICATION.mdにnative DLL ABIやwire protocolが定義されていないため、
-  `/api/bonDriver/channels/:type/:channel/stream` のHTTP adapterのみ提供します。
-  ネイティブWindows DLLは実装・推測していません。
-- systemd用の安全なサンプルは `fixtures/hotarun.service.example` です。
+「実装済みだが実機未確認」と「未実装」は次のように分かれます。
+
+### 実装済みだが実機未確認
+
+- 実機チューナーを使ったGR / BS / CS / SKYのTS配信
+- 実機BS4KチューナーからのTLV入力
+- 実機の外部`tlvDecoder`との接続
+- 実機環境でのRivarun接続
+- BonDriver_MirakurunクライアントからのHTTP adapter接続
+- 実機のスキャン結果、チューナーのデバイス固有動作
+
+BS4K MMT/TLV discovery自体はfixture/testで実装・検証済みですが、実機のBS4K/TLV decoderでの動作は未確認です。
+
+### 未実装または対象外
+
+- native BonDriver Windows DLL ABI
+
+  BonDriverのnative DLL ABIやwire protocolは`SPECIFICATION.md`で定義されていません。そのため、推測によるWindows DLL実装は行わず、実装済みなのは`/api/bonDriver/channels/:type/:channel/stream`のHTTP adapterだけです。
+
+- 仕様で定義されていないMMTの細部
+- EPG収集、番組データベース、録画管理
+- HLS / DASH、DLNA、トランスコード、メディアサーバー機能
+- 設定ファイルのホットリロード
+- `SKY`のチャンネルスキャン（配信設定とTS配信は対応）
+
+また、環境に`rustfmt`が導入されていないため、今回の検証ではrustfmtを実行していません。
 
 ## ライセンス
 
