@@ -4,8 +4,6 @@ pub mod stream;
 pub mod scan;
 pub mod ui;
 
-use std::net::SocketAddr;
-
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub struct UnixPeerCredentials {
@@ -55,12 +53,11 @@ use axum::{
 use crate::error::ApiError;
 use crate::config::AppState;
 
-/// The listener is LAN-facing, so reject non-local/private peers before any
-/// route handler can allocate a tuner. Unix requests carry peer credentials
-/// instead of a SocketAddr; they are checked against the process owner/group.
-/// A missing extension remains allowed only for in-process Router tests. The
-/// real Unix listener always installs a credential extension, using an invalid
-/// sentinel when the kernel lookup fails.
+/// TCP peers are intentionally not filtered by client IP. Unix requests carry
+/// peer credentials instead of a socket address; they are checked against the
+/// process owner/group. A missing extension remains allowed only for in-process
+/// Router tests. The real Unix listener always installs a credential extension,
+/// using an invalid sentinel when the kernel lookup fails.
 pub async fn access_control(
     State(state): State<std::sync::Arc<AppState>>,
     request: Request<Body>,
@@ -73,37 +70,17 @@ pub async fn access_control(
         // A TCP-shaped extension is not proof of a Unix peer. This also keeps
         // tests/custom listeners from bypassing credential validation.
         false
-    } else if let Some(ConnectInfo(peer)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
-        let allowed = if request.uri().path().starts_with("/api/config/") {
-            crate::config::ip_in_admin_cidr(peer.ip(), &state.server.admin_cidr)
-        } else {
-            crate::config::ip_in_cidr(peer.ip(), &state.server.cidr)
-        };
-        allowed
     } else {
+        // Client IP/CIDR is not an access-control boundary. Keep accepting
+        // arbitrary TCP peers, including requests with ConnectInfo attached.
         true
     };
 
     #[cfg(not(unix))]
-    let peer_allowed = if let Some(ConnectInfo(peer)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
-        let allowed = if request.uri().path().starts_with("/api/config/") {
-            crate::config::ip_in_admin_cidr(peer.ip(), &state.server.admin_cidr)
-        } else {
-            crate::config::ip_in_cidr(peer.ip(), &state.server.cidr)
-        };
-        allowed
-    } else {
-        true
-    };
+    let peer_allowed = true;
 
     if !peer_allowed {
-        let reason = if request.extensions().get::<ConnectInfo<SocketAddr>>().is_some() {
-            "client address is not allowed"
-        } else if state.server.socket.is_some() {
-            "unix socket peer is not authorized"
-        } else {
-            "client address is not allowed"
-        };
+        let reason = "unix socket peer is not authorized";
         return (
             StatusCode::FORBIDDEN,
             Json(ApiError::new(403, reason)),

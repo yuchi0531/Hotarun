@@ -202,7 +202,8 @@ pub struct ServerConfig {
     pub socket: Option<String>,
     #[serde(default, rename = "CIDR", alias = "cidr", alias = "cidrs")]
     pub cidr: Vec<String>,
-    /// Administrative endpoints are loopback-only unless explicitly widened.
+    /// Legacy compatibility setting. It is retained in config/API output but
+    /// is not used to authorize TCP clients.
     #[serde(default, rename = "adminCIDR", alias = "adminCidr", alias = "admin_cidr")]
     pub admin_cidr: Vec<String>,
     #[serde(default = "default_log_level", rename = "logLevel", alias = "log_level")]
@@ -241,12 +242,12 @@ impl ServerConfig {
             errors.push("logLevel must be between -1 and 3".to_owned());
         }
         for value in &self.cidr {
-            if parse_cidr(value).is_none() {
+            if !valid_cidr(value) {
                 errors.push(format!("invalid CIDR: {value}"));
             }
         }
         for value in &self.admin_cidr {
-            if parse_cidr(value).is_none() {
+            if !valid_cidr(value) {
                 errors.push(format!("invalid adminCIDR: {value}"));
             }
         }
@@ -254,53 +255,14 @@ impl ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Cidr {
-    V4(u32, u8),
-    V6(u128, u8),
-}
-
-fn parse_cidr(value: &str) -> Option<Cidr> {
-    let (address, prefix) = value.trim().split_once('/')?;
-    let prefix: u8 = prefix.parse().ok()?;
-    if let Ok(ip) = address.parse::<std::net::Ipv4Addr>() {
-        if prefix > 32 { return None; }
-        return Some(Cidr::V4(u32::from(ip), prefix));
+fn valid_cidr(value: &str) -> bool {
+    let Some((address, prefix)) = value.trim().split_once('/') else { return false };
+    let Ok(prefix) = prefix.parse::<u8>() else { return false };
+    if address.parse::<std::net::Ipv4Addr>().is_ok() {
+        prefix <= 32
+    } else {
+        address.parse::<std::net::Ipv6Addr>().is_ok() && prefix <= 128
     }
-    let ip = address.parse::<std::net::Ipv6Addr>().ok()?;
-    if prefix > 128 { return None; }
-    Some(Cidr::V6(u128::from(ip), prefix))
-}
-
-pub fn ip_in_cidr(ip: std::net::IpAddr, cidrs: &[String]) -> bool {
-    if cidrs.is_empty() {
-        return match ip {
-            std::net::IpAddr::V4(value) => value.is_loopback() || value.is_private() || value.is_link_local(),
-            std::net::IpAddr::V6(value) => value.is_loopback() || ((value.segments()[0] & 0xfe00) == 0xfc00) || ((value.segments()[0] & 0xffc0) == 0xfe80),
-        };
-    }
-    cidrs.iter().filter_map(|value| parse_cidr(value)).any(|network| match (network, ip) {
-        (Cidr::V4(network, prefix), std::net::IpAddr::V4(value)) => {
-            let value = u32::from(value);
-            let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
-            value & mask == network & mask
-        }
-        (Cidr::V6(network, prefix), std::net::IpAddr::V6(value)) => {
-            let value = u128::from(value);
-            let mask = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
-            value & mask == network & mask
-        }
-        _ => false,
-    })
-}
-
-/// Administrative routes must not inherit the ordinary LAN default.  An
-/// explicit `adminCIDR` is an opt-in exception for a trusted management LAN.
-pub fn ip_in_admin_cidr(ip: std::net::IpAddr, cidrs: &[String]) -> bool {
-    if cidrs.is_empty() {
-        return ip.is_loopback();
-    }
-    ip_in_cidr(ip, cidrs)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -319,16 +281,12 @@ mod server_tests {
     fn server_config_validates_ranges_and_cidr() {
         let valid = ServerConfig { port: 40772, socket: None, cidr: vec!["192.168.0.0/16".into()], admin_cidr: vec!["192.168.1.0/24".into()], log_level: 3, max_log_history: 10 };
         assert!(valid.validate().is_ok());
-        assert!(ip_in_cidr("192.168.10.2".parse().unwrap(), &valid.cidr));
-        assert!(!ip_in_cidr("10.0.0.1".parse().unwrap(), &valid.cidr));
         let invalid = ServerConfig { port: 0, socket: None, cidr: vec!["broken".into()], admin_cidr: vec!["broken".into()], log_level: 4, max_log_history: 0 };
         assert!(invalid.validate().is_err());
         for socket in ["", "   ", "\t\n"] {
             let invalid = ServerConfig { socket: Some(socket.to_owned()), ..ServerConfig::default() };
             assert!(invalid.validate().is_err());
         }
-        assert!(ip_in_admin_cidr("127.0.0.1".parse().unwrap(), &[]));
-        assert!(!ip_in_admin_cidr("192.168.1.2".parse().unwrap(), &[]));
     }
 
     #[test]

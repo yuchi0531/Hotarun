@@ -20,7 +20,7 @@ Hotarun自身は録画、EPG収集、映像変換を行いません。
 - Mirakurun互換を目指した設定・一覧・状態・ストリームAPI
 - チャンネルスキャン（GR / BS / CS / BS4K、同期・非同期・進捗・中止・dryRun）
 - 設定保存APIと再起動要求API
-- CIDR、管理用CIDR、Origin / Referer検査、CORS
+- 互換用CIDR設定、Origin / Referer検査、CORS
 - Unix socket、peer credential検証、socket mode `0660`
 - ログファイル、管理イベント履歴、health / status API
 - 素のHTML/CSS/JavaScriptによるWeb UI
@@ -28,6 +28,10 @@ Hotarun自身は録画、EPG収集、映像変換を行いません。
 - BonDriver_Mirakurun向けHTTPストリームアダプター
 
 設計上の基準は [SPECIFICATION.md](SPECIFICATION.md) です。このREADMEは現在のコードの実装状況を説明するもので、`SPECIFICATION.md`は変更していません。
+
+## リリース
+
+バージョンは [SemVer](https://semver.org/) に準拠します。リリースタグは `vX.Y.Z` 形式です。現在のバージョンは `0.0.1` です。
 
 ## 対応放送
 
@@ -191,8 +195,7 @@ maxLogHistory: 1000
 ```
 
 - `port`の既定値は`40772`です。`socket`を指定するとUnix socketを使用します。
-- `CIDR`を省略した場合、TCP接続はloopback、private、link-localアドレスのみ許可します。指定した場合は指定範囲だけを許可します。
-- `/api/config/*`の管理APIは、`adminCIDR`を省略するとloopbackだけを許可します。管理LANから使う場合だけ`adminCIDR`を明示してください。
+- `CIDR`と`adminCIDR`は既存設定との互換性のため読み書きしますが、TCPクライアントの接続可否判定には使用しません。任意のTCP peerから接続できます。
 - `logLevel`は`-1`から`3`です。`maxLogHistory`は`/api/log`で返す管理イベント履歴の上限です。
 - Unix socketはbind時にmode `0660`となり、要求時にpeerのUIDまたはGIDがHotarunプロセスの有効UID/GIDと一致することを確認します。
 
@@ -348,9 +351,9 @@ systemctl enable --now hotarun
 
 ## セキュリティとネットワーク
 
-Hotarunには認証機能がありません。TCPリスナーは`0.0.0.0`で待ち受けますが、接続元は既定でloopback / private / link-localに制限されます。`CIDR`を指定した場合はその範囲だけを許可します。
+Hotarunには認証機能がありません。TCPリスナーは`0.0.0.0`で待ち受け、クライアントIP/CIDRによる接続拒否は行いません。インターネットへ直接公開せず、必要に応じてファイアウォールやリバースプロキシで接続元を制限してください。
 
-- 管理API（`/api/config/*`）は、既定ではloopbackだけを許可します。管理LANへ公開する場合は`adminCIDR`を明示してください。
+- `CIDR`と`adminCIDR`は旧設定を壊さないために保持されますが、TCPのアクセス制御には影響しません。管理APIもクライアントIPでは拒否しません。
 - `Origin`はHTTP scheme、host、portが`Host`と一致する場合だけ許可します。
 - `Referer`がある場合はhostが`Host`と一致する必要があります。
 - CORSは許可済みのOriginに対してだけ応答ヘッダーを付けます。
@@ -370,7 +373,7 @@ git diff --check
 ```
 
 - `cargo test --no-fail-fast`: **112 passed**
-- HTTP API、ストリーム共有、priority takeover、decoder、scan lifecycle、設定保存、Unix socket、CIDR/CORS、Web UIを統合テストで検証
+- HTTP API、ストリーム共有、priority takeover、decoder、scan lifecycle、設定保存、任意TCP peer、Unix socket、Origin/Referer/CORS、Web UIを統合テストで検証
 - Rust製`hotarun-test-fixture`でTS/TLV、scan入力、decoder入出力を再現
 - BS4K MMT/TLV discoveryはfixture/testでactual TLV-NIT、MMT PLT/SDT、fragment/interleave、複数serviceを検証
 

@@ -105,8 +105,11 @@ async fn server_config_rejects_blank_socket_without_writing_it() {
 }
 
 #[tokio::test]
-async fn config_routes_are_loopback_only_by_default_and_reject_duplicate_channels() {
-    let state = Arc::new(AppState::default());
+async fn config_routes_allow_any_tcp_peer_and_reject_duplicate_channels() {
+    let mut configured = AppState::default();
+    configured.server.cidr = vec!["127.0.0.0/8".to_owned()];
+    configured.server.admin_cidr = vec!["127.0.0.0/8".to_owned()];
+    let state = Arc::new(configured);
     let request = Request::builder()
         .method(Method::PUT)
         .uri("/api/config/channels")
@@ -119,9 +122,7 @@ async fn config_routes_are_loopback_only_by_default_and_reject_duplicate_channel
     let mut request = Request::builder().uri("/api/config/channels").body(Body::empty()).unwrap();
     request.extensions_mut().insert(ConnectInfo("192.168.1.2:1234".parse::<std::net::SocketAddr>().unwrap()));
     let response = app(state).oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
-    assert_eq!(body["code"], 403);
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
