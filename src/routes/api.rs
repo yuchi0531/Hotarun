@@ -10,15 +10,19 @@ use axum::{Json, Router, extract::{Path, Query, State}, routing::get};
 use serde::Serialize;
 
 use crate::{
-    config::{AppState, Channel, ChannelType},
+    config::{channel_services, AppState, Channel, ChannelType},
     error::ApiError,
     tuner::TunerState,
 };
 
 /// Mirakurun の ServiceItemId。networkId と serviceId の混同を避けるため、
 /// serviceId そのものではなく networkId + 5桁の serviceId で作る。
+pub fn try_service_item_id(network_id: i64, service_id: i64) -> Option<i64> {
+    network_id.checked_mul(100_000)?.checked_add(service_id)
+}
+
 pub fn service_item_id(network_id: i64, service_id: i64) -> i64 {
-    network_id.saturating_mul(100_000).saturating_add(service_id)
+    try_service_item_id(network_id, service_id).expect("validated ServiceItemId components")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,14 +44,6 @@ pub struct ServiceItem {
     #[serde(rename = "type")]
     pub service_type: i64,
     pub channel: ServiceChannel,
-}
-
-fn extra_i64(channel: &Channel, key: &str) -> Option<i64> {
-    match channel.extra.get(key) {
-        Some(serde_json::Value::Number(n)) => n.as_i64(),
-        Some(serde_json::Value::String(s)) => s.parse().ok(),
-        _ => None,
-    }
 }
 
 fn channel_type_name(channel_type: ChannelType) -> &'static str {
@@ -101,6 +97,7 @@ pub struct StatusResponse {
     pub pid: u32,
     pub tuners: StatusTuners,
     pub streams: StatusStreams,
+    pub scan: crate::scan::ChannelScanStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,6 +157,28 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusRespons
         streams: StatusStreams {
             active: active_streams,
         },
+        scan: state.scan.status().await,
+    }))
+}
+
+/// Lightweight health endpoint used by systemd/load balancers (§18).
+async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "status": "ok",
+        "tuners": state.tuners.len(),
+        "streams": state.manager.len(),
+    }))
+}
+
+/// Operational log endpoint. Entries are bounded by `server.maxLogHistory` and
+/// are intended for the small administrative view, while tracing remains the
+/// daemon's primary logging sink.
+async fn operational_log(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "level": state.server.log_level,
+        "maxLogHistory": state.server.max_log_history,
+        "entries": state.log_entries().await,
     }))
 }
 
@@ -196,34 +215,53 @@ async fn get_service(
 /// 現在の channels.yml からサービス一覧を合成する。
 /// Hotarunの設定は1チャンネルに最大1つの serviceId を持つため、サービスも1件生成する。
 pub fn service_items(channels: &[Channel]) -> Vec<ServiceItem> {
-    channels
-        .iter()
-        .filter_map(|channel| {
-            let service_id = channel.serviceId?;
-            let network_id = extra_i64(channel, "networkId").unwrap_or(0);
-            let service_type = extra_i64(channel, "serviceType")
-                .or_else(|| extra_i64(channel, "service_type"))
-                .unwrap_or(0);
-            Some(ServiceItem {
-                id: service_item_id(network_id, service_id),
-                serviceId: service_id,
-                networkId: network_id,
-                name: channel.name.clone(),
-                service_type,
-                channel: ServiceChannel {
-                    channel_type: channel.channel_type,
-                    channel: channel.channel.clone(),
-                },
-            })
-        })
+    let mut candidates = Vec::new();
+    for channel in channels {
+        for service in channel_services(channel) {
+            let Some(id) = try_service_item_id(service.networkId, service.serviceId) else { continue };
+            if !crate::config::valid_service_item_component(service.networkId)
+                || !crate::config::valid_service_item_component(service.serviceId)
+            {
+                continue;
+            }
+            candidates.push((id, ServiceItem {
+                    id,
+                    serviceId: service.serviceId,
+                    networkId: service.networkId,
+                    name: service.name,
+                    service_type: service.service_type,
+                    channel: ServiceChannel {
+                        channel_type: channel.channel_type,
+                        channel: channel.channel.clone(),
+                    },
+            }));
+        }
+    }
+    let mut counts = std::collections::HashMap::new();
+    for (id, _) in &candidates {
+        *counts.entry(*id).or_insert(0usize) += 1;
+    }
+    candidates.into_iter()
+        .filter_map(|(id, item)| (counts.get(&id) == Some(&1)).then_some(item))
         .collect()
 }
 
 pub fn find_service(channels: &[Channel], id: i64) -> Option<(ServiceItem, Channel)> {
-    let matches: Vec<_> = channels.iter().filter_map(|channel| {
-        let item = service_items(std::slice::from_ref(channel)).into_iter().next()?;
-        (item.id == id).then(|| (item, channel.clone()))
-    }).collect();
+    let matches: Vec<_> = channels
+        .iter()
+        .flat_map(|channel| {
+            channel_services(channel).into_iter().filter_map(|service| {
+                (try_service_item_id(service.networkId, service.serviceId) == Some(id)).then(|| (ServiceItem {
+                    id,
+                    serviceId: service.serviceId,
+                    networkId: service.networkId,
+                    name: service.name,
+                    service_type: service.service_type,
+                    channel: ServiceChannel { channel_type: channel.channel_type, channel: channel.channel.clone() },
+                }, channel.clone()))
+            })
+        })
+        .collect();
     (matches.len() == 1).then(|| matches.into_iter().next().unwrap())
 }
 
@@ -375,6 +413,8 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/version", get(version))
         .route("/api/status", get(status))
+        .route("/api/health", get(health))
+        .route("/api/log", get(operational_log))
         .route("/api/channels", get(list_channels))
         .route("/api/channels/{channel_type}/{channel}", get(get_channel))
         .route("/api/services", get(list_services))
@@ -424,6 +464,15 @@ mod tests {
         let mut second = channel();
         second.name = "duplicate".to_owned();
         assert!(find_service(&[channel(), second], 400101).is_none());
+    }
+
+    #[test]
+    fn service_items_skip_invalid_components_and_never_saturate_ids() {
+        let mut invalid = channel();
+        invalid.extra.insert("networkId".into(), serde_json::json!(-1));
+        assert!(service_items(&[invalid]).is_empty());
+        assert_eq!(try_service_item_id(i64::MAX, 1), None);
+        assert_eq!(service_item_id(4, 101), 400101);
     }
 
     #[test]

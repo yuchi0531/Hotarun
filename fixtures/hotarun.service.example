@@ -1,0 +1,19 @@
+[Unit]
+Description=Hotarun tuner server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hotarun
+Group=hotarun
+ExecStart=/usr/bin/hotarun --config-dir /etc/hotarun
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/hotarun /var/log/hotarun /run
+
+[Install]
+WantedBy=multi-user.target

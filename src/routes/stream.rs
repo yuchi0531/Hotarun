@@ -5,13 +5,13 @@
 //! - 要求ヘッダ `X-Mirakurun-Priority` による低優先度ストリームの奪取に対応する。
 //! - 成功時は `video/MP2T` + `X-Mirakurun-Tuner-User-ID` で tuner stdout を
 //!   fan-out配信する。同一物理chは共有し、per-client boundedキューで
-//!   ノンブロッキング配信する (overflowした遅延subscriberは終了 §10)。
+//!   ノンブロッキング配信する (overflow時は当該チャンクを落として接続維持 §10)。
 //!   起動成功は spawn 成功で即時確定し、初回バイト待ちはしない (§8)。
 //! - 失敗は確保前に Error JSON: 404 (chなし) / 503 no available tuners / 500 (spawn失敗)。
 //!   Busyのみ 50 x 250ms リトライし、spawn失敗は即500 (文字列判定なし)。
 //! - `HEAD` はチューナー確保なしで 200 空返し。
 
-use std::{collections::{HashMap, VecDeque}, sync::Arc, time::Duration};
+use std::{collections::{HashMap, VecDeque}, sync::{atomic::{AtomicBool, Ordering}, Arc}, time::Duration};
 
 use axum::{
     Router,
@@ -306,8 +306,8 @@ async fn acquire_tuner(
 }
 
 /// 共有ストリームの Body (§10 fan-out)。
-/// pumpが配信するboundedキューを受信する。遅延時はpump側でsubscriberを
-/// 閉じ、壊れたまま無期限に残さない。
+/// pumpが配信するboundedキューを受信する。遅延subscriberは接続を維持し、
+/// bounded queue overflow時にチャンクを落とす。overflowはログ/メトリクスで観測する。
 /// Drop時は guard/reaper方式で確実に解放する:
 /// 同期ヒント (`release_hint_sync`) + 非同期停止 (`stop_if_idle`/`release`)
 /// + watcherのorphan回収。fire-and-forget単独にしない。
@@ -332,6 +332,7 @@ struct DecodedStreamBody {
     decoder: RegisteredDecoder,
     input_task: Option<tokio::task::JoinHandle<()>>,
     output_task: Option<tokio::task::JoinHandle<()>>,
+    lease_released: Arc<AtomicBool>,
 }
 
 /// Per-client MPEG-TS service filter. The tuner remains shared and emits full
@@ -351,6 +352,7 @@ struct ServiceStreamBody {
     selected_pids: Option<Vec<u16>>,
     pat_psi: PsiAssembler,
     pmt_psi: PsiAssembler,
+    lease_released: Arc<AtomicBool>,
 }
 
 const SERVICE_PRE_READY_LIMIT: usize = 8 * 1024 * 1024;
@@ -370,9 +372,15 @@ impl PsiAssembler {
             if pointer + 1 > payload.len() {
                 return sections;
             }
-            if !self.bytes.is_empty() && pointer > 0 {
-                self.bytes.extend_from_slice(&payload[1..=pointer]);
-                self.take_complete(&mut sections);
+            if !self.bytes.is_empty() {
+                if pointer > 0 {
+                    self.bytes.extend_from_slice(&payload[1..=pointer]);
+                    self.take_complete(&mut sections);
+                }
+                // A PUSI packet starts a new section after the pointer.  Do
+                // not let an incomplete previous header determine the
+                // length of that new section.
+                self.bytes.clear();
             }
             &payload[pointer + 1..]
         } else {
@@ -557,6 +565,9 @@ impl Drop for ServiceStreamBody {
         let idx = self.index;
         let generation = self.generation;
         let priority = self.priority;
+        if self.lease_released.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let hinted = mgr.release_hint_sync_lease(idx, generation, Some(priority));
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -588,6 +599,9 @@ impl Drop for DecodedStreamBody {
             handle.spawn(async move {
                 decoder.stop().await;
             });
+        }
+        if self.lease_released.swap(true, Ordering::AcqRel) {
+            return;
         }
         let mgr = self.manager.clone();
         let idx = self.index;
@@ -773,14 +787,12 @@ async fn spawn_decoded_body(
     priority: i32,
     rx: mpsc::Receiver<Vec<u8>>,
     template: &str,
+    lease_released: Arc<AtomicBool>,
 ) -> Result<DecodedStreamBody, ApiError> {
     let (program, args) = match build_passthrough_command(template) {
         Ok(command) => command,
         Err(error) => {
-            let _ = state
-                .manager
-                .release_lease(idx, generation, Some(priority))
-                .await;
+            release_decoded_lease(&state.manager, idx, generation, priority, &lease_released).await;
             return Err(ApiError::new(
                 500,
                 format!("invalid TLV decoder command: {error}"),
@@ -790,10 +802,7 @@ async fn spawn_decoded_body(
     let decoder = match spawn_decoder_program(&program, &args).await {
         Ok(decoder) => decoder,
         Err(error) => {
-            let _ = state
-                .manager
-                .release_lease(idx, generation, Some(priority))
-                .await;
+            release_decoded_lease(&state.manager, idx, generation, priority, &lease_released).await;
             return Err(ApiError::new(
                 500,
                 format!("failed to start TLV decoder: {error}"),
@@ -803,27 +812,18 @@ async fn spawn_decoded_body(
     let decoder = match state.decoders.register(decoder).await {
         Ok(decoder) => decoder,
         Err(error) => {
-            let _ = state
-                .manager
-                .release_lease(idx, generation, Some(priority))
-                .await;
+            release_decoded_lease(&state.manager, idx, generation, priority, &lease_released).await;
             return Err(ApiError::new(503, error));
         }
     };
     let Some(mut stdin) = decoder.take_stdin() else {
         decoder.stop().await;
-        let _ = state
-            .manager
-            .release_lease(idx, generation, Some(priority))
-            .await;
+        release_decoded_lease(&state.manager, idx, generation, priority, &lease_released).await;
         return Err(ApiError::new(500, "TLV decoder has no stdin"));
     };
     let Some(mut stdout) = decoder.take_stdout() else {
         decoder.stop().await;
-        let _ = state
-            .manager
-            .release_lease(idx, generation, Some(priority))
-            .await;
+        release_decoded_lease(&state.manager, idx, generation, priority, &lease_released).await;
         return Err(ApiError::new(500, "TLV decoder has no stdout"));
     };
 
@@ -873,15 +873,32 @@ async fn spawn_decoded_body(
         decoder,
         input_task: Some(input_task),
         output_task: Some(output_task),
+        lease_released,
     })
 }
 
-fn tuner_tlv_decoder(state: &AppState, idx: usize, ct: ChannelType, decode: bool) -> Option<String> {
-    // TLVDecoder is deliberately considered only for BS4K. TS tuners keep their
-    // existing full-TS path and `decoder` field is not part of this route.
-    (ct == ChannelType::BS4K && decode)
-        .then(|| state.tuners.get(idx)?.tlv_decoder.clone())
-        .flatten()
+async fn release_decoded_lease(
+    manager: &SharedTunerManager,
+    index: usize,
+    generation: u64,
+    priority: i32,
+    released: &AtomicBool,
+) {
+    if !released.swap(true, Ordering::AcqRel) {
+        let _ = manager.release_lease(index, generation, Some(priority)).await;
+    }
+}
+
+fn tuner_decoder(state: &AppState, idx: usize, ct: ChannelType, decode: bool) -> Option<String> {
+    if !decode {
+        return None;
+    }
+    let tuner = state.tuners.get(idx)?;
+    if ct == ChannelType::BS4K {
+        tuner.tlv_decoder.clone()
+    } else {
+        tuner.decoder.clone()
+    }
 }
 
 /// GET /api/channels/{type}/{channel}/stream
@@ -901,10 +918,9 @@ async fn get_channel_stream(
     let (idx, rx, generation) = acquire_tuner(&state, ct, &channel, priority).await?;
 
     // 映像ヘッダはチューナー確保後に送出する (§11)。
-    let body = if let Some(template) = tuner_tlv_decoder(&state, idx, ct, decode) {
-        // A BS4K channel with no tlvDecoder, and decode=0 even with one, is
-        // intentionally raw TLV passthrough. It must not enter the TS filter.
-        Body::new(spawn_decoded_body(&state, idx, generation, priority, rx, &template).await?)
+    let body = if let Some(template) = tuner_decoder(&state, idx, ct, decode) {
+        // Decoder branches are per-client.  The tuner itself remains shared.
+        Body::new(spawn_decoded_body(&state, idx, generation, priority, rx, &template, Arc::new(AtomicBool::new(false))).await?)
     } else {
         Body::new(SharedStreamBody {
             rx,
@@ -985,11 +1001,36 @@ async fn service_stream(
     let decode = parse_decode(&query)?;
     let priority = parse_priority(&headers);
     let (idx, rx, generation) = acquire_tuner(&state, channel.channel_type, &channel, priority).await?;
+    if let Some(template) = tuner_decoder(&state, idx, channel.channel_type, decode) {
+        let Some(target_service_id) = target_service_id else {
+            // BS4K/TLV has no MPEG-TS PID stage; keep the existing per-client
+            // decoder path for that format.
+            let body = Body::new(spawn_decoded_body(&state, idx, generation, priority, rx, &template, Arc::new(AtomicBool::new(false))).await?);
+            return Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "video/MP2T")
+                .header("X-Mirakurun-Tuner-User-ID", idx.to_string())
+                .body(body)
+                .map_err(|e| ApiError::new(500, format!("failed to build response: {e}")));
+        };
+        // For TS services, filter the shared full TS before feeding the
+        // decoder.  Filtering decoder stdout would corrupt decoder framing
+        // and could leak another service's PID set.
+        let lease_released = Arc::new(AtomicBool::new(false));
+        let filtered = spawn_service_filter(state.manager.clone(), idx, generation, priority, rx, target_service_id);
+        let body = Body::new(spawn_decoded_body(&state, idx, generation, priority, filtered, &template, lease_released).await?);
+        return Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "video/MP2T")
+            .header("X-Mirakurun-Tuner-User-ID", idx.to_string())
+            .body(body)
+            .map_err(|e| ApiError::new(500, format!("failed to build response: {e}")));
+    }
     if channel.channel_type == ChannelType::BS4K {
         // A BS4K service is one TLV stream/service by definition. Do not run
         // the MPEG-TS PAT/PMT filter or reinterpret its bytes as TS packets.
-        let body = if let Some(template) = tuner_tlv_decoder(&state, idx, channel.channel_type, decode) {
-            Body::new(spawn_decoded_body(&state, idx, generation, priority, rx, &template).await?)
+        let body = if let Some(template) = tuner_decoder(&state, idx, channel.channel_type, decode) {
+            Body::new(spawn_decoded_body(&state, idx, generation, priority, rx, &template, Arc::new(AtomicBool::new(false))).await?)
         } else {
             Body::new(SharedStreamBody {
                 rx,
@@ -1020,6 +1061,7 @@ async fn service_stream(
         selected_pids: None,
         pat_psi: PsiAssembler::default(),
         pmt_psi: PsiAssembler::default(),
+        lease_released: Arc::new(AtomicBool::new(false)),
     };
     Response::builder()
         .status(200)
@@ -1027,6 +1069,46 @@ async fn service_stream(
         .header("X-Mirakurun-Tuner-User-ID", idx.to_string())
         .body(Body::new(stream_body))
         .map_err(|e| ApiError::new(500, format!("failed to build response: {e}")))
+}
+
+fn spawn_service_filter(
+    manager: SharedTunerManager,
+    index: usize,
+    generation: u64,
+    priority: i32,
+    rx: mpsc::Receiver<Vec<u8>>,
+    target_service_id: u16,
+) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, filtered_rx) = mpsc::channel(crate::tuner::STREAM_QUEUE_LEN);
+    tokio::spawn(async move {
+        let mut body = ServiceStreamBody {
+            rx,
+            manager,
+            index,
+            generation,
+            priority,
+            target_service_id,
+            input: Vec::new(),
+            pending: VecDeque::new(),
+            pre_ready: VecDeque::new(),
+            pmt_pid: None,
+            selected_pids: None,
+            pat_psi: PsiAssembler::default(),
+            pmt_psi: PsiAssembler::default(),
+            // The filter task is only a pipeline stage.  The decoder body is
+            // the sole owner of the tuner lease for this request.
+            lease_released: Arc::new(AtomicBool::new(true)),
+        };
+        while let Some(chunk) = body.rx.recv().await {
+            body.process_chunk(&chunk);
+            while let Some(packet) = body.pending.pop_front() {
+                if tx.send(packet).await.is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    filtered_rx
 }
 
 async fn head_service_stream(
@@ -1065,6 +1147,12 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/services/{id}/stream",
             get(service_stream).head(head_service_stream),
+        )
+        // HTTP adapter used by BonDriver_Mirakurun clients. The actual Windows
+        // driver ABI is outside this Rust daemon and is not specified by §10.
+        .route(
+            "/api/bonDriver/channels/{channel_type}/{channel}/stream",
+            get(get_stream).head(head_stream),
         )
 }
 
@@ -1342,6 +1430,16 @@ mod tests {
         assert_eq!(state.manager.len(), 0);
     }
 
+    #[test]
+    fn service_psi_pusi_zero_discards_an_incomplete_section() {
+        let mut assembler = PsiAssembler::default();
+        assert!(assembler.feed(&[0, 0x00, 0xb0, 0xff, 0x00], true).is_empty());
+        let section = [0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 101, 0xe1, 0, 0, 0, 0, 0];
+        let mut payload = vec![0];
+        payload.extend_from_slice(&section);
+        assert_eq!(assembler.feed(&payload, true), vec![section.to_vec()]);
+    }
+
     #[tokio::test]
     async fn decoder_registry_shutdown_ends_body_without_stdin_eof() {
         let state = bs4k_state(
@@ -1528,6 +1626,7 @@ mod tests {
             selected_pids: None,
             pat_psi: PsiAssembler::default(),
             pmt_psi: PsiAssembler::default(),
+            lease_released: Arc::new(AtomicBool::new(false)),
         };
         body.process_packet(psi_packet(0, &pat));
         assert_eq!(body.pmt_pid, Some(0x100));
@@ -1569,6 +1668,7 @@ mod tests {
             selected_pids: None,
             pat_psi: PsiAssembler::default(),
             pmt_psi: PsiAssembler::default(),
+            lease_released: Arc::new(AtomicBool::new(false)),
         };
         let packets = split_psi_packets(0, &pat);
         body.process_packet(packets[0]);
@@ -1605,6 +1705,7 @@ mod tests {
             selected_pids: None,
             pat_psi: PsiAssembler::default(),
             pmt_psi: PsiAssembler::default(),
+            lease_released: Arc::new(AtomicBool::new(false)),
         };
         for packet in split_psi_packets(0, &pat) {
             body.process_packet(packet);
@@ -1650,6 +1751,7 @@ mod tests {
             selected_pids: None,
             pat_psi: PsiAssembler::default(),
             pmt_psi: PsiAssembler::default(),
+            lease_released: Arc::new(AtomicBool::new(false)),
         };
         body.process_packet(psi_packet(0, &pat_section(0, 202, 0x200)));
         body.process_packet(psi_packet(0, &pat_section(1, 101, 0x100)));

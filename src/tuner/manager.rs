@@ -13,7 +13,7 @@
 //!   同期デクリメント) + `stop_if_idle` の非同期停止 + `spawn_watcher` の
 //!   orphan回収で三重化し、fire-and-forget単独にしない。
 //! - 共有/fan-out (§9§10): 同一物理chは `acquire` で共有し、per-clientへの
-//!   配信はノンブロッキングfan-out (HWM 16MB相当、overflow subscriberは終了)。
+//!   配信はノンブロッキングfan-out (HWM 16MB相当、overflow時はchunkをdropし接続維持)。
 //! - 常駐監視: `spawn_watcher` が spawn直後の wait→poll_exit/respawn を
 //!   担当する。終了は `stop_all` (shutdown連携) で全slot停止する。
 
@@ -49,6 +49,7 @@ pub const STREAM_QUEUE_LEN: usize = 512;
 /// Number of chunks rejected because a subscriber queue was full.
 pub static STREAM_FANOUT_OVERFLOWS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+static NEXT_PUMP_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// 起動・確保の失敗理由。Busy (再試行可) と Spawn失敗 (即500) を分離する。
 /// 従来の `contains("spawn")` 文字列判定を廃止するためのenum化。
@@ -112,7 +113,6 @@ fn command_usable(tuner: &Tuner) -> bool {
 /// 1チューナー分の状態 + プロセス。
 #[derive(Debug)]
 pub struct TunerSlot {
-    index: usize,
     name: String,
     command_template: Option<String>,
     /// 対応放送種別 (§9 条件1)。
@@ -131,6 +131,10 @@ pub struct TunerSlot {
     /// fan-out先 (§10)。各要素が1クライアントへのboundedキュー。
     /// pumpが `try_send` でノンブロッキング配信し、遅延者がいても切断しない。
     senders: Vec<mpsc::Sender<Vec<u8>>>,
+    /// stdout pump token.  Unlike `process_generation`, this changes for a
+    /// respawn too: a logical lease can survive a respawn, but bytes buffered
+    /// by the old OS process must not survive it.
+    pump_token: u64,
     /// Priority of each active stream request.  The maximum is the priority
     /// of the physical stream and is used for takeover decisions.
     request_priorities: Vec<i32>,
@@ -145,10 +149,9 @@ pub struct TunerSlot {
 }
 
 impl TunerSlot {
-    fn new(index: usize, tuner: &Tuner) -> Self {
+    fn new(_index: usize, tuner: &Tuner) -> Self {
         let usable = command_usable(tuner);
         Self {
-            index,
             name: tuner.name.clone(),
             command_template: tuner.command.clone(),
             types: tuner.types.clone(),
@@ -166,6 +169,7 @@ impl TunerSlot {
             start_generation: 0,
             process: None,
             senders: Vec::new(),
+            pump_token: 0,
             request_priorities: Vec::new(),
             respawn_pending: false,
             idle_generation: 0,
@@ -496,6 +500,7 @@ impl TunerManager {
             }
             // 状態遷移のみロック内。
             s.start_generation = s.start_generation.wrapping_add(1);
+            s.pump_token = NEXT_PUMP_TOKEN.fetch_add(1, Ordering::Relaxed);
             let start_generation = s.start_generation;
             let start_epoch = self.shutdown_epoch.load(Ordering::Acquire);
             s.state = TunerState::Starting;
@@ -723,6 +728,7 @@ impl TunerManager {
             s.wanted_channel = None;
             s.current_channel = None;
             s.pid = None;
+            s.pump_token = NEXT_PUMP_TOKEN.fetch_add(1, Ordering::Relaxed);
             s.senders.clear();
             s.process.take()
         };
@@ -751,6 +757,7 @@ impl TunerManager {
             let mut s = self.slot_mutex(index)?.lock().await;
             s.cancel_idle_stop();
             s.start_generation = s.start_generation.wrapping_add(1);
+            s.pump_token = NEXT_PUMP_TOKEN.fetch_add(1, Ordering::Relaxed);
             if (s.state == TunerState::Disabled || s.state == TunerState::Fault)
                 && s.process.is_none()
             {
@@ -826,6 +833,7 @@ impl TunerManager {
         s.idle_generation = s.idle_generation.wrapping_add(1);
         s.idle_notify.notify_one();
         s.state = TunerState::Stopping;
+        s.pump_token = NEXT_PUMP_TOKEN.fetch_add(1, Ordering::Relaxed);
         s.senders.clear();
         Ok(s.process.take())
     }
@@ -989,15 +997,30 @@ impl TunerManager {
     }
 
     /// pumpを起動する。tuner stdoutを読み、購読者全員へ `try_send` する。
-    /// Full は当該subscriberを閉じて削除する。無期限に壊れたHTTP bodyを
-    /// 残さず、overflowはカウンタとログで観測可能にする。
+    /// Full は当該subscriberを切断せず、そのチャンクだけを落とす。
+    /// 遅延clientを維持しつつ、overflowはカウンタとログで観測可能にする。
     pub fn spawn_pump(
         self: &Arc<Self>,
         index: usize,
         mut stdout: tokio::process::ChildStdout,
     ) -> JoinHandle<()> {
         let mgr = Arc::clone(self);
+        let token = NEXT_PUMP_TOKEN.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
+            // Install the token before reading.  All process replacement paths
+            // invalidate the previous token while holding the slot lock, so a
+            // delayed old pump can only discard its remaining bytes.
+            let Some(slot) = mgr.slots.get(index) else { return };
+            {
+                let mut slot = slot.lock().await;
+                if slot.process.is_none() {
+                    return;
+                }
+                if token <= slot.pump_token {
+                    return;
+                }
+                slot.pump_token = token;
+            }
             let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
             loop {
                 let n = match tokio::io::AsyncReadExt::read(&mut stdout, &mut buf)
@@ -1008,24 +1031,27 @@ impl TunerManager {
                     Err(_) => break,
                 };
                 let chunk = buf[..n].to_vec();
-                if !mgr.fanout_chunk(index, chunk).await {
+                if !mgr.fanout_chunk(index, token, chunk).await {
                     continue;
                 }
             }
         })
     }
 
-    async fn fanout_chunk(&self, index: usize, chunk: Vec<u8>) -> bool {
+    async fn fanout_chunk(&self, index: usize, token: u64, chunk: Vec<u8>) -> bool {
         let Some(m) = self.slots.get(index) else { return false };
         let mut slot = m.lock().await;
+        if slot.pump_token != token {
+            return false;
+        }
         let mut overflowed = false;
         slot.senders.retain(|tx| match tx.try_send(chunk.clone()) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 overflowed = true;
                 STREAM_FANOUT_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(index, "tuner fan-out subscriber queue overflow; subscriber closed");
-                false
+                tracing::warn!(index, "tuner fan-out subscriber queue overflow; chunk dropped");
+                true
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         });
@@ -1189,6 +1215,7 @@ impl TunerManager {
             };
             let success = status.success();
             tracing::warn!(index, success, %status, "tuner process exited");
+            s.pump_token = NEXT_PUMP_TOKEN.fetch_add(1, Ordering::Relaxed);
             s.process = None;
             s.pid = None;
             (
@@ -1838,6 +1865,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_pump_chunks_are_not_delivered_after_takeover() {
+        let m = TunerManager::shared(vec![tuner_with_command("t", Some(&fixture("hold"))) ]);
+        m.start_with_priority(0, "13", 1).await.unwrap();
+        let _old_subscription = m.create_subscription(0).await.unwrap();
+        let old_token = m.slots[0].lock().await.pump_token;
+
+        m.takeover_with_priority(0, "27", 2).await.unwrap();
+        let mut new_subscription = m.create_subscription(0).await.unwrap();
+        assert!(!m.fanout_chunk(0, old_token, b"old-process-residue".to_vec()).await);
+        assert!(tokio::time::timeout(Duration::from_millis(50), new_subscription.recv())
+            .await
+            .is_err());
+        m.stop(0).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn fault_closes_existing_subscriber() {
         let m = TunerManager::shared(vec![tuner_with_command("t", Some(&fixture("hold")))]);
         let (tx, mut rx) = mpsc::channel(1);
@@ -1859,10 +1902,11 @@ mod tests {
         let mut rx = m.create_subscription(0).await.unwrap();
         let before = STREAM_FANOUT_OVERFLOWS.load(Ordering::Relaxed);
         for _ in 0..=STREAM_QUEUE_LEN {
-            m.fanout_chunk(0, vec![0; 1]).await;
+            let token = m.slots[0].lock().await.pump_token;
+            m.fanout_chunk(0, token, vec![0; 1]).await;
         }
         assert!(STREAM_FANOUT_OVERFLOWS.load(Ordering::Relaxed) > before);
-        while rx.recv().await.is_some() {}
+        assert!(rx.try_recv().is_ok(), "overflow must not close a delayed subscriber");
         m.stop(0).await.unwrap();
     }
 }

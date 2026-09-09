@@ -152,8 +152,9 @@ async fn real_http_router_covers_bs4k_decoder_service_sharing_and_error_routes()
         (Method::GET, "/api/config/tuners", StatusCode::OK),
         (Method::GET, "/api/channels/BS4K/missing/stream", StatusCode::NOT_FOUND),
         (Method::GET, "/api/channels/BS4K/logical/stream?decode=2", StatusCode::BAD_REQUEST),
+        (Method::HEAD, "/api/bonDriver/channels/BS4K/logical/stream", StatusCode::OK),
         (Method::GET, "/api/does-not-exist", StatusCode::NOT_FOUND),
-        (Method::POST, "/api/config/channels", StatusCode::METHOD_NOT_ALLOWED),
+        (Method::POST, "/api/config/channels", StatusCode::UNSUPPORTED_MEDIA_TYPE),
     ] {
         let response = open(Arc::clone(&state), method, uri).await;
         assert_eq!(response.status(), expected, "{uri}");
@@ -288,4 +289,65 @@ async fn real_http_router_respawns_a_stream_and_keeps_the_body_lease_valid() {
     state.manager.stop_all().await;
     let _ = to_bytes(body, 16 * 1024).await.unwrap();
     assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn configured_ts_decoder_is_used_for_each_http_client() {
+    let fixture = fixture();
+    let state = Arc::new(AppState::from_lists(
+        vec![channel("GR", "27", ChannelType::GR, None)],
+        vec![Tuner {
+            name: "fixture".into(), types: vec![ChannelType::GR],
+            command: Some(format!("{fixture} bytes")), tlv_decoder: None,
+            decoder: Some(format!("{fixture} decoder-prefix")), extra: HashMap::new(),
+        }],
+    ));
+    let response = open(Arc::clone(&state), Method::GET, "/api/channels/GR/27/stream").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+    assert!(body.starts_with(b"decoded:bytes"), "decoder stdout was not sent to HTTP: {body:?}");
+    state.manager.stop_all().await;
+}
+
+#[tokio::test]
+async fn service_ts_decoder_receives_only_the_selected_service_pids() {
+    let fixture = fixture();
+    let state = Arc::new(AppState::from_lists(
+        vec![channel("GR", "27", ChannelType::GR, None)],
+        vec![Tuner {
+            name: "fixture".into(),
+            types: vec![ChannelType::GR],
+            command: Some(format!("{fixture} dispatch <channel>")),
+            tlv_decoder: None,
+            decoder: Some(format!("{fixture} decoder-upper")),
+            extra: HashMap::new(),
+        }],
+    ));
+    let response = open(Arc::clone(&state), Method::GET, "/api/services/100101/stream").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body_stream = response.into_body();
+    let first = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body_stream).poll_frame(cx)),
+    )
+    .await
+    .expect("filtered decoder did not produce a frame")
+    .expect("filtered decoder ended before a frame")
+    .expect("filtered decoder body error")
+    .into_data()
+    .unwrap();
+    state.manager.stop_all().await;
+    let mut body = first.to_vec();
+    body.extend_from_slice(&to_bytes(body_stream, 16 * 1024).await.unwrap());
+    let packets = body
+        .chunks_exact(188)
+        .filter(|packet| packet.first() == Some(&0x47))
+        .collect::<Vec<_>>();
+    assert!(!packets.is_empty(), "decoder should receive filtered TS");
+    assert!(packets.iter().all(|packet| {
+        let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
+        matches!(pid, 0 | 0x100 | 0x101)
+    }));
+    assert!(!body.windows(2).any(|window| window == [0x02, 0x00]), "other service PID leaked through decoder");
+    state.manager.stop_all().await;
 }
