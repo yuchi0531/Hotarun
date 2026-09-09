@@ -34,7 +34,12 @@ jobs:
           ref: ${{ steps.release.outputs.tag }}
 
       - name: Install ARM32 cross compiler
-        run: sudo apt-get update && sudo apt-get install --yes gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+        run: >-
+          sudo apt-get
+          -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources"
+          -o Dir::Etc::sourceparts="-"
+          update
+          && sudo apt-get install --yes gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
 
       - name: Install Rust targets
         uses: dtolnay/rust-toolchain@stable
