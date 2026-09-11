@@ -49,13 +49,31 @@ fn main() {
             None => write_ts_fixture(),
         },
         "scan-dispatch" => {
-            let channel = std::env::args().nth(2).and_then(|value| value.parse::<u16>().ok()).unwrap_or(13);
-            write_ts_fixture_with_services(101 + u32::from(channel.saturating_sub(13)) * 2, 202 + u32::from(channel.saturating_sub(13)) * 2);
+            let channel = std::env::args().nth(2).unwrap_or_default();
+            let number = channel.parse::<u16>().unwrap_or(13);
+            write_ts_fixture_with_services(101 + u32::from(number.saturating_sub(13)) * 2, 202 + u32::from(number.saturating_sub(13)) * 2);
+        }
+        "scan-dispatch-unauthorized" => write_ts_fixture_with_service(101, 3),
+        "scan-timeout-then-success" => {
+            if std::env::args().nth(2).as_deref() == Some("13") {
+                std::thread::park();
+            } else {
+                write_ts_fixture();
+            }
         }
         "decoder-hold" | "hold" => std::thread::park(),
         "repeat-hold" => loop {
             write_ts_fixture();
             std::thread::sleep(std::time::Duration::from_millis(20));
+        },
+        "delayed-repeat-hold" => {
+            // Keep the scan lease alive long enough for a test HTTP request to
+            // subscribe after the scanner has started the fan-out pump.
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            loop {
+                write_ts_fixture();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         },
         "multipart-hold" => loop {
             let channel = std::env::args().nth(2).and_then(|value| value.parse::<u16>().ok()).unwrap_or(13);
@@ -102,15 +120,27 @@ fn write_ts_fixture_with_services(first_service: u32, second_service: u32) {
     write_packet(0x200, b"other-pid");
 }
 
+fn write_ts_fixture_with_service(service: u32, service_type: u8) {
+    let mut pat = vec![0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00];
+    pat.extend_from_slice(&[(service >> 8) as u8, service as u8, 0xe1, 0x00, 0, 0, 0, 0]);
+    write_packet(0, &pat);
+    write_packet(0x10, &nit());
+    write_packet(0x11, &sdt_with_services(&[(service, service_type, b"Unauthorized")]));
+}
+
 fn nit() -> Vec<u8> {
     vec![0x40, 0xb0, 0x09, 0, 0, 0xc1, 0, 0, 0, 0, 0, 0]
 }
 
 fn sdt(first_service: u32, second_service: u32) -> Vec<u8> {
+    sdt_with_services(&[(first_service, 1, b"One!"), (second_service, 2, b"Two!")])
+}
+
+fn sdt_with_services(services: &[(u32, u8, &[u8])]) -> Vec<u8> {
     let mut section = vec![0x42, 0, 0, 0, 1, 0xc1, 0, 0, 0, 0, 0];
-    for (service, name) in [(first_service, b"One!".as_slice()), (second_service, b"Two!".as_slice())] {
+    for &(service, service_type, name) in services {
         section.extend_from_slice(&[(service >> 8) as u8, service as u8, 0xfc, 0xf0, (name.len() + 5) as u8,
-            0x48, (name.len() + 3) as u8, 1, 0, name.len() as u8]);
+            0x48, (name.len() + 3) as u8, service_type, 0, name.len() as u8]);
         section.extend_from_slice(name);
     }
     let section_length = section.len() + 4 - 3;

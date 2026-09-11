@@ -135,7 +135,7 @@ async function render() {
             app.append(text('h2', 'Scan'));
             const form = document.createElement('form');
             const type = document.createElement('select');
-            ['', 'GR', 'BS', 'CS', 'BS4K'].forEach(v => {
+            ['', 'GR', 'BS', 'CS', 'SKY', 'BS4K'].forEach(v => {
                 const o = text('option', v || 'All');
                 o.value = v;
                 type.appendChild(o);
@@ -144,7 +144,7 @@ async function render() {
             dry.type = 'checkbox';
             const refresh = document.createElement('input');
             refresh.type = 'checkbox';
-            refresh.checked = true;
+            refresh.checked = false;
             const status = document.createElement('pre');
             form.append(
                 text('label', 'Type '),
@@ -263,6 +263,7 @@ mod tests {
         assert!(SCRIPT.contains("method: 'PUT'"));
         assert!(SCRIPT.contains("method: 'DELETE'"));
         assert!(SCRIPT.contains("b.type = 'button'"));
+        assert!(SCRIPT.contains("'SKY'"));
         assert!(SCRIPT.contains("dryRun"));
         assert!(SCRIPT.contains("refresh"));
     }

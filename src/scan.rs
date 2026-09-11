@@ -2,15 +2,33 @@
 //! HTTP scan API.  Hardware-specific tuning remains in `TunerManager`, which
 //! makes this module usable with the Rust fixture binary in integration tests.
 
-use std::{collections::{HashMap, HashSet}, path::Path, sync::{atomic::{AtomicBool, Ordering}, Arc}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet}, path::Path, sync::{atomic::{AtomicBool, AtomicU8, Ordering}, Arc}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 use serde::Serialize;
-use tokio::{io::AsyncReadExt, sync::{mpsc, Mutex, Notify}};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 use crate::{config::{write_yaml_atomic, AppState, Channel, ChannelService, ChannelType}, tuner::TunerError};
 
 pub const CHANNEL_TIMEOUT: Duration = Duration::from_secs(20);
 pub const SCAN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanMode {
+    Channel,
+    Service,
+}
+
+/// Generation of a scan task.  This is deliberately a distinct type from the
+/// tuner process generation used for lease release and subscriptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScanGeneration(u64);
+
+fn default_scan_mode(kind: ChannelType) -> ScanMode {
+    match kind {
+        ChannelType::GR => ScanMode::Channel,
+        ChannelType::BS | ChannelType::CS | ChannelType::SKY | ChannelType::BS4K => ScanMode::Service,
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[allow(non_snake_case)]
@@ -31,7 +49,7 @@ pub struct ChannelScanStatus {
 impl Default for ChannelScanStatus {
     fn default() -> Self {
         Self { status: "idle".to_owned(), type_: None, progress: 0, scanned: 0, total: 0,
-            channels: Vec::new(), error: None, dryRun: false, refresh: true, startedAt: None }
+            channels: Vec::new(), error: None, dryRun: false, refresh: false, startedAt: None }
     }
 }
 
@@ -40,16 +58,48 @@ pub struct ScanManager {
     state: Mutex<ScanState>,
     cancelled: AtomicBool,
     cancel_notify: Notify,
+    cancel_watch: watch::Sender<ScanGeneration>,
+    #[cfg(test)]
+    commit_barrier: Mutex<Option<Arc<ScanCommitBarrier>>>,
+    #[cfg(test)]
+    read_barrier: Mutex<Option<Arc<ScanReadBarrier>>>,
 }
 
 impl Default for ScanManager {
-    fn default() -> Self { Self { state: Mutex::new(ScanState::default()), cancelled: AtomicBool::new(false), cancel_notify: Notify::new() } }
+    fn default() -> Self {
+        let (cancel_watch, _) = watch::channel(ScanGeneration(0));
+        Self {
+            state: Mutex::new(ScanState::default()),
+            cancelled: AtomicBool::new(false),
+            cancel_notify: Notify::new(),
+            cancel_watch,
+            #[cfg(test)]
+            commit_barrier: Mutex::new(None),
+            #[cfg(test)]
+            read_barrier: Mutex::new(None),
+        }
+    }
 }
 
 #[derive(Debug)]
 struct ScanState {
     status: ChannelScanStatus,
     task_running: bool,
+    scan_generation: ScanGeneration,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ScanCommitBarrier {
+    reached: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ScanReadBarrier {
+    reached: Notify,
+    release: Notify,
 }
 
 /// Own exactly one scanner lease.  A scan must never stop a process it does
@@ -57,44 +107,70 @@ struct ScanState {
 struct ScanLease {
     manager: crate::tuner::SharedTunerManager,
     index: usize,
-    generation: u64,
-    released: bool,
+    process_generation: u64,
+    release_state: Arc<AtomicU8>,
 }
+
+const LEASE_OWNED: u8 = 0;
+const LEASE_RELEASING: u8 = 1;
+const LEASE_RELEASED: u8 = 2;
 
 impl ScanLease {
     async fn release(&mut self) {
-        if !self.released {
-            let _ = self.manager.release_lease(self.index, self.generation, Some(0)).await;
-            // A scan-only process can be re-tuned immediately.  The idle
-            // check is generation/use-count guarded, so a concurrent stream
-            // keeps the shared process alive.
-            let _ = self.manager.stop_if_idle(self.index).await;
-            self.released = true;
-        }
+        if self
+            .release_state
+            .compare_exchange(LEASE_OWNED, LEASE_RELEASING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        { return; }
+        let _ = tokio::spawn(scan_lease_cleanup(
+            self.manager.clone(),
+            self.index,
+            self.process_generation,
+            Arc::clone(&self.release_state),
+        )).await;
     }
+}
+
+async fn scan_lease_cleanup(
+    manager: crate::tuner::SharedTunerManager,
+    index: usize,
+    process_generation: u64,
+    release_state: Arc<AtomicU8>,
+) {
+    if let Err(error) = manager
+        .release_lease_immediately(index, process_generation, Some(0))
+        .await
+    {
+        tracing::warn!(tuner = index, %error, "scan lease release failed");
+        return;
+    }
+    // Logical ownership is irrevocably released before idle stopping.
+    release_state.store(LEASE_RELEASED, Ordering::Release);
 }
 
 impl Drop for ScanLease {
     fn drop(&mut self) {
-        if self.released {
-            return;
-        }
         let manager = self.manager.clone();
         let index = self.index;
-        let generation = self.generation;
+        let process_generation = self.process_generation;
+        if self
+            .release_state
+            .compare_exchange(LEASE_OWNED, LEASE_RELEASING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        { return; }
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Err(error) = manager.release_lease(index, generation, Some(0)).await {
-                    tracing::warn!(tuner = index, %error, "scan process cleanup failed");
-                }
-                let _ = manager.stop_if_idle(index).await;
-            });
+            handle.spawn(scan_lease_cleanup(
+                manager,
+                index,
+                process_generation,
+                Arc::clone(&self.release_state),
+            ));
         }
     }
 }
 
 impl Default for ScanState {
-    fn default() -> Self { Self { status: ChannelScanStatus::default(), task_running: false } }
+    fn default() -> Self { Self { status: ChannelScanStatus::default(), task_running: false, scan_generation: ScanGeneration(0) } }
 }
 
 impl ScanManager {
@@ -104,43 +180,57 @@ impl ScanManager {
 
     pub async fn begin(
         self: &Arc<Self>, state: Arc<AppState>, kind: Option<ChannelType>, dry_run: bool, refresh: bool,
-        asynchronous: bool, service_type: Option<i64>,
+        asynchronous: bool, service_type: Option<i64>, scan_mode: Option<ScanMode>,
     ) -> Result<Option<String>, String> {
-        let types = kind.map(|value| vec![value]).unwrap_or_else(|| vec![ChannelType::GR, ChannelType::BS, ChannelType::CS, ChannelType::BS4K]);
-        let total = types.iter().map(|value| scan_channels(*value).len()).sum();
-        {
+        let types = kind.map(|value| vec![value]).unwrap_or_else(|| default_scan_types(&state.channels));
+        let target_sets = types.iter().copied().map(|value| {
+            (value, scan_targets(value, &state.channels).into_iter().collect::<HashSet<_>>())
+        }).collect::<HashMap<_, _>>();
+        let total = types.iter().map(|value| scan_targets(*value, &state.channels).len()).sum();
+        let scan_generation = {
             let mut current = self.state.lock().await;
             if current.task_running { return Err("channel scan is already running".to_owned()); }
             self.cancelled.store(false, Ordering::Release);
+            current.scan_generation = ScanGeneration(current.scan_generation.0.wrapping_add(1));
             current.task_running = true;
             current.status = ChannelScanStatus { status: "running".to_owned(), type_: kind, progress: 0,
                 scanned: 0, total, channels: Vec::new(), error: None, dryRun: dry_run, refresh,
                 startedAt: Some(epoch_seconds()) };
-        }
+            current.scan_generation
+        };
         let manager = Arc::clone(self);
         let work = async move {
-            let result = tokio::time::timeout(SCAN_TIMEOUT, run_scan(&state, &manager, &types, dry_run, refresh, service_type))
-                .await
-                .map_err(|_| "scan timed out".to_owned())
-                .and_then(|result| result);
+            let (result, timed_out) = run_scan_with_timeout(
+                &state, &manager, scan_generation, &types, kind.is_none(), dry_run,
+                refresh, scan_mode, service_type, target_sets, SCAN_TIMEOUT,
+            ).await;
+            let result = if timed_out { Err("scan timed out".to_owned()) } else { result };
             let mut current = manager.state.lock().await;
-            current.task_running = false;
-            match &result {
-                Ok(channels) => {
-                    current.status.status = "complete".to_owned();
-                    current.status.progress = 100;
-                    current.status.channels = channels.clone();
-                }
-                Err(error) if current.status.status != "cancelled" => {
+            if current.scan_generation == scan_generation && current.task_running {
+                current.task_running = false;
+                let cancelled = !timed_out && (current.status.status == "cancelled"
+                    || manager.cancelled.load(Ordering::Acquire));
+                if timed_out {
                     current.status.status = "error".to_owned();
-                    current.status.error = Some(error.clone());
-                    let state = state.clone();
-                    let error = error.clone();
-                    tokio::spawn(async move {
-                        state.record_log(0, format!("channel scan failed: {error}")).await;
-                    });
+                    current.status.error = Some("scan timed out".to_owned());
+                } else if !cancelled {
+                    match &result {
+                        Ok(channels) => {
+                            current.status.status = "complete".to_owned();
+                            current.status.progress = 100;
+                            current.status.channels = channels.clone();
+                        }
+                        Err(error) => {
+                            current.status.status = "error".to_owned();
+                            current.status.error = Some(error.clone());
+                            let state = state.clone();
+                            let error = error.clone();
+                            tokio::spawn(async move {
+                                state.record_log(0, format!("channel scan failed: {error}")).await;
+                            });
+                        }
+                    }
                 }
-                Err(_) => {}
             }
             result
         };
@@ -162,54 +252,228 @@ impl ScanManager {
         if !state.task_running { return Ok(false); }
         self.cancelled.store(true, Ordering::Release);
         self.cancel_notify.notify_waiters();
+        let _ = self.cancel_watch.send(state.scan_generation);
         state.status.status = "cancelled".to_owned();
         Ok(true)
     }
 
+    async fn is_running_generation(&self, scan_generation: ScanGeneration) -> bool {
+        let state = self.state.lock().await;
+        state.scan_generation == scan_generation
+            && state.task_running
+            && state.status.status == "running"
+            && !self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn is_cancelled_generation(&self, scan_generation: ScanGeneration) -> bool {
+        let state = self.state.lock().await;
+        state.scan_generation != scan_generation
+            || state.status.status == "cancelled"
+            || self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn cancellation_receiver(&self) -> watch::Receiver<ScanGeneration> { self.cancel_watch.subscribe() }
+
     pub async fn is_running(&self) -> bool {
         let state = self.state.lock().await;
         state.task_running && state.status.status == "running" && !self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn commit(
+        &self,
+        scan_generation: ScanGeneration,
+        existing: &[Channel],
+        found: Vec<Channel>,
+        types: &[ChannelType],
+        refresh: bool,
+        service_type: Option<i64>,
+        scan_mode: Option<ScanMode>,
+        target_sets: HashMap<ChannelType, HashSet<String>>,
+        dry_run: bool,
+        directory: Option<&Path>,
+        config_lock: Option<Arc<Mutex<()>>>,
+    ) -> Result<Vec<Channel>, String> {
+        // Test-only pause point: this represents the interval after the last
+        // channel has been detected and merged, but before the commit lock is
+        // acquired.  It makes the cancellation boundary deterministic.
+        #[cfg(test)]
+        if let Some(barrier) = self.commit_barrier.lock().await.clone() {
+            barrier.reached.notify_one();
+            barrier.release.notified().await;
+        }
+
+        let _config_lock = if let Some(lock) = config_lock.as_ref() {
+            Some(lock.lock().await)
+        } else {
+            None
+        };
+        // Do not hold the scan state lock while waiting for a configuration
+        // PUT.  Once the configuration lock is ours, take the state lock and
+        // perform the cancellation/generation check again: this is the
+        // commit linearization point shared with cancel().
+        let mut state = self.state.lock().await;
+        if state.scan_generation != scan_generation
+            || !state.task_running
+            || state.status.status != "running"
+            || self.cancelled.load(Ordering::Acquire)
+        {
+            return Err("scan cancelled".to_owned());
+        }
+        let latest = directory
+            .map(|directory| crate::config::load_channels_config(&directory.join("channels.yml")))
+            .unwrap_or_else(|| existing.to_vec());
+        let merged = merge_channels_with_targets(&latest, found, types, refresh, service_type, scan_mode, Some(&target_sets))?;
+        if !dry_run {
+            let directory = directory.ok_or_else(|| "configuration directory is unavailable".to_owned())?;
+            write_yaml_atomic(&directory.join("channels.yml"), &merged)?;
+        }
+        // Mark the scan committed while still holding state.  A cancel that
+        // arrives after this point observes a completed scan and returns
+        // false instead of changing a successfully written configuration to
+        // "cancelled" in the completion epilogue.
+        state.task_running = false;
+        state.status.status = "complete".to_owned();
+        state.status.progress = 100;
+        state.status.channels = merged.clone();
+        Ok(merged)
     }
 }
 
 pub fn scan_channels(kind: ChannelType) -> Vec<String> {
     match kind {
         ChannelType::GR => (13..=62).map(|n| n.to_string()).collect(),
-        ChannelType::BS => (1..=23).flat_map(|n| (0..=3).map(move |slot| format!("BS{n:02}_{slot}"))).collect(),
+        ChannelType::BS => {
+            let mut targets = (1..=23)
+                .flat_map(|n| (0..=3).map(move |slot| format!("BS{n:02}_{slot}")))
+                .chain((101..=256).map(|n| n.to_string()))
+                .collect::<Vec<_>>();
+            targets.dedup();
+            targets
+        }
         ChannelType::CS => (2..=24).map(|n| format!("CS{n}")).collect(),
         ChannelType::BS4K => vec!["BS4K45328".to_owned()],
         ChannelType::SKY => Vec::new(),
     }
 }
 
-async fn run_scan(state: &Arc<AppState>, scans: &Arc<ScanManager>, types: &[ChannelType], dry_run: bool, refresh: bool, service_type: Option<i64>) -> Result<Vec<Channel>, String> {
+/// Return the Mirakurun scan targets for a type.  SKY deliberately has no
+/// fabricated numeric range: Mirakurun accepts arbitrary identifiers such as
+/// `CH585` or `ATXHD` and its scanner does not generate a default SKY list.
+/// For Hotarun, configured SKY channel identifiers are therefore the explicit
+/// scan target set; all other types retain their Mirakurun defaults above.
+pub fn scan_targets(kind: ChannelType, configured: &[Channel]) -> Vec<String> {
+    let mut targets = match kind {
+        ChannelType::SKY => configured
+            .iter()
+            .filter(|channel| channel.channel_type == ChannelType::SKY)
+            .map(logical_channel)
+            .collect::<Vec<_>>(),
+        ChannelType::BS => {
+            let mut targets = scan_channels(kind);
+            targets.extend(
+                configured
+                    .iter()
+                    .filter(|channel| channel.channel_type == ChannelType::BS)
+                    .map(logical_channel),
+            );
+            targets
+        }
+        _ => return scan_channels(kind),
+    };
+    let mut seen = HashSet::new();
+    targets.retain(|target| seen.insert(target.clone()));
+    if kind == ChannelType::SKY {
+        targets.sort();
+    }
+    targets
+}
+
+/// Resolve the logical/physical target represented by a configured channel.
+/// Older configurations may contain `logical:serviceId` entries; scans now
+/// write the logical channel and keep additional services in `extra.services`.
+fn logical_channel(channel: &Channel) -> String {
+    if let Some(physical) = channel.extra.get("physicalChannel").and_then(|value| value.as_str()) {
+        return physical.to_owned();
+    }
+    if let Some(service_id) = channel.serviceId {
+        if let Some((logical, suffix)) = channel.channel.rsplit_once(':') {
+            if suffix.parse::<i64>().ok() == Some(service_id) {
+                return logical.to_owned();
+            }
+        }
+    }
+    channel.channel.clone()
+}
+
+fn configured_channel_for<'a>(channels: &'a [Channel], kind: ChannelType, logical: &str) -> Option<&'a Channel> {
+    channels.iter().find(|channel| channel.channel_type == kind && logical_channel(channel) == logical)
+}
+
+fn default_scan_types(configured: &[Channel]) -> Vec<ChannelType> {
+    let mut types = vec![ChannelType::GR, ChannelType::BS, ChannelType::CS];
+    if !scan_targets(ChannelType::SKY, configured).is_empty() {
+        types.push(ChannelType::SKY);
+    }
+    types.push(ChannelType::BS4K);
+    types
+}
+
+async fn run_scan(
+    state: &Arc<AppState>,
+    scans: &Arc<ScanManager>,
+    scan_generation: ScanGeneration,
+    types: &[ChannelType],
+    allow_partial: bool,
+    dry_run: bool,
+    refresh: bool,
+    scan_mode: Option<ScanMode>,
+    service_type: Option<i64>,
+    target_sets: HashMap<ChannelType, HashSet<String>>,
+) -> Result<Vec<Channel>, String> {
     // An in-memory AppState is used by the unit/API smoke tests without a
     // tuner.  It is not a scan failure: dry-run returns the merged snapshot,
     // while a real save reports the missing configuration directory below.
     if state.config_dir.is_none() && state.manager.is_empty() {
         if dry_run {
-            return merge_channels(&state.channels, Vec::new(), types, refresh);
+            return merge_channels_with_targets(&state.channels, Vec::new(), types, refresh, service_type, scan_mode, Some(&target_sets));
         }
         return Err("configuration directory is unavailable".to_owned());
     }
+    let needs_tuner = refresh || types.iter().any(|kind| {
+        target_sets
+            .get(kind)
+            .is_none_or(|targets| targets.iter().any(|logical| configured_channel_for(&state.channels, *kind, logical).is_none()))
+    });
     if state.config_dir.is_some()
+        && needs_tuner
         && !(0..state.manager.len()).any(|index| supports_scan_type(state, index, types))
     {
         return Err("no compatible tuner available".to_owned());
     }
     let mut found = Vec::new();
     let mut found_types = HashSet::new();
+    let mut retained_types = HashSet::new();
     let mut successful_attempts = 0usize;
     let mut failed_attempts = 0usize;
     let mut last_error = None;
     for kind in types {
-        for logical in scan_channels(*kind) {
-            if !scans.is_running().await { return Err("scan cancelled".to_owned()); }
+        for logical in scan_targets(*kind, &state.channels) {
+            if !scans.is_running_generation(scan_generation).await { return Err("scan cancelled".to_owned()); }
+            if !refresh && configured_channel_for(&state.channels, *kind, &logical).is_some() {
+                // Mirakurun's default is not to rescan an already configured
+                // target. The target remains selected for merge, while stale
+                // records outside this request's target set are removed.
+                retained_types.insert(*kind);
+                let mut current = scans.state.lock().await;
+                current.status.scanned += 1;
+                current.status.progress = ((current.status.scanned * 100) / current.status.total.max(1)).min(99) as u8;
+                continue;
+            }
             // CHANNEL_TIMEOUT is a budget for the complete logical channel,
             // not for each tuner candidate.  In particular, a dead tuner must
             // not give every subsequent candidate another full 20 seconds.
             let channel_deadline = Instant::now() + CHANNEL_TIMEOUT;
-            let bytes = match tune_and_read(state, scans, *kind, &logical, channel_deadline).await {
+            let bytes = match tune_and_read(state, scans, scan_generation, *kind, &logical, channel_deadline, service_type, scan_mode).await {
                 Ok(bytes) => {
                     successful_attempts += 1;
                     bytes
@@ -218,7 +482,7 @@ async fn run_scan(state: &Arc<AppState>, scans: &Arc<ScanManager>, types: &[Chan
                     return Err(error);
                 }
                 Err(error) => {
-                    if error.starts_with("no valid services:") {
+                    if error.starts_with("no valid services:") || (error == "tuner is busy" && successful_attempts == 0) {
                         // The tuner delivered a complete TS, but its SI did
                         // not satisfy the scan contract.  Keep this as a
                         // successful read so the final error is the useful
@@ -234,14 +498,7 @@ async fn run_scan(state: &Arc<AppState>, scans: &Arc<ScanManager>, types: &[Chan
                     Vec::new()
                 }
             };
-            let detected = detect_scan_services(*kind, &logical, &bytes, &state.channels).into_iter().filter(|channel| {
-                service_type.is_none_or(|wanted| {
-                    channel.extra.get("serviceType").and_then(|value| value.as_i64()) == Some(wanted)
-                        || channel.extra.get("services").and_then(|value| value.as_array()).is_some_and(|services| {
-                            services.iter().any(|service| service.get("serviceType").and_then(|value| value.as_i64()) == Some(wanted))
-                        })
-                })
-            }).collect::<Vec<_>>();
+            let detected = detect_scan_services_filtered(*kind, &logical, &bytes, &state.channels, service_type, scan_mode);
             if !detected.is_empty() {
                 found_types.insert(*kind);
             }
@@ -259,11 +516,21 @@ async fn run_scan(state: &Arc<AppState>, scans: &Arc<ScanManager>, types: &[Chan
     }
     let missing_types = types
         .iter()
-        .filter(|kind| !found_types.contains(kind))
+        .filter(|kind| !found_types.contains(kind) && !retained_types.contains(kind))
         .map(|kind| format!("{kind:?}"))
         .collect::<Vec<_>>();
-    if !missing_types.is_empty() {
+    if !allow_partial && !missing_types.is_empty() {
         return Err(format!("no valid services detected for {}", missing_types.join(", ")));
+    }
+    if found.is_empty() && retained_types.is_empty() {
+        return Err(if successful_attempts == 0 && failed_attempts > 0 {
+            format!(
+                "all tuner scan attempts failed: {}",
+                last_error.unwrap_or_else(|| "no successful tuner attempt".to_owned())
+            )
+        } else {
+            "no valid services detected".to_owned()
+        });
     }
     // A scan with no configured tuner must not be reported as a successful
     // configuration save.  Keep the legacy configuration-directory error for
@@ -272,12 +539,55 @@ async fn run_scan(state: &Arc<AppState>, scans: &Arc<ScanManager>, types: &[Chan
     // writing an empty channels.yml.
     found.sort_by_key(|channel| (channel.channel_type as u8, channel.channel.clone(), channel.serviceId));
     found.dedup_by(|left, right| left.channel_type == right.channel_type && left.channel == right.channel && left.serviceId == right.serviceId);
-    let merged = merge_channels(&state.channels, found, types, refresh)?;
-    if !dry_run {
-        let directory = state.config_dir.as_deref().ok_or_else(|| "configuration directory is unavailable".to_owned())?;
-        write_yaml_atomic(&directory.join("channels.yml"), &merged)?;
+    let commit_types = if allow_partial {
+        types.iter().copied().filter(|kind| found_types.contains(kind) || retained_types.contains(kind)).collect::<Vec<_>>()
+    } else {
+        types.to_vec()
+    };
+    scans.commit(
+        scan_generation,
+        &state.channels,
+        found,
+        &commit_types,
+        refresh,
+        service_type,
+        scan_mode,
+        target_sets,
+        dry_run,
+        state.config_dir.as_deref(),
+        Some(Arc::clone(&state.channel_config_lock)),
+    ).await
+}
+
+async fn run_scan_with_timeout(
+    state: &Arc<AppState>,
+    scans: &Arc<ScanManager>,
+    scan_generation: ScanGeneration,
+    types: &[ChannelType],
+    allow_partial: bool,
+    dry_run: bool,
+    refresh: bool,
+    scan_mode: Option<ScanMode>,
+    service_type: Option<i64>,
+    target_sets: HashMap<ChannelType, HashSet<String>>,
+    timeout: Duration,
+) -> (Result<Vec<Channel>, String>, bool) {
+    let scan_future = run_scan(
+        state, scans, scan_generation, types, allow_partial, dry_run, refresh,
+        scan_mode, service_type, target_sets,
+    );
+    tokio::pin!(scan_future);
+    tokio::select! {
+        result = &mut scan_future => (result, false),
+        _ = tokio::time::sleep(timeout) => {
+            // Cancellation wakes the channel reader, and awaiting the future
+            // here is what makes scanner-only lease cleanup part of the
+            // timeout transition rather than a Drop side effect.
+            let _ = scans.cancel().await;
+            let result = (&mut scan_future).await;
+            (result, true)
+        }
     }
-    Ok(merged)
 }
 
 fn supports_scan_type(state: &Arc<AppState>, index: usize, types: &[ChannelType]) -> bool {
@@ -297,33 +607,36 @@ fn remaining(deadline: Instant) -> Result<Duration, String> {
 }
 
 async fn release_with_deadline(lease: &mut ScanLease, deadline: Instant) {
-    let Ok(budget) = remaining(deadline) else { return };
-    let _ = tokio::time::timeout(budget, lease.release()).await;
+    // The channel deadline applies to tuning and reading, not to ownership
+    // cleanup.  A scan must finish reclaiming its final lease before moving to
+    // the next channel; otherwise the normal HTTP idle grace can make a
+    // single tuner look busy for the rest of the scan.
+    let _ = deadline;
+    lease.release().await;
 }
 
-async fn release_generation_with_deadline(
+async fn release_process_lease_with_deadline(
     manager: &crate::tuner::SharedTunerManager,
     index: usize,
-    generation: u64,
+    process_generation: u64,
     deadline: Instant,
 ) {
     let manager = manager.clone();
-    let release = async move {
-        let _ = manager.release_lease(index, generation, None).await;
-    };
-    if let Ok(budget) = remaining(deadline) {
-        let _ = tokio::time::timeout(budget, release).await;
-    } else {
-        tokio::spawn(release);
-    }
+    let _ = deadline;
+    let _ = manager
+        .release_lease_immediately(index, process_generation, Some(0))
+        .await;
 }
 
 async fn tune_and_read(
     state: &Arc<AppState>,
     scans: &Arc<ScanManager>,
+    scan_generation: ScanGeneration,
     kind: ChannelType,
     logical: &str,
     deadline: Instant,
+    service_type: Option<i64>,
+    scan_mode: Option<ScanMode>,
 ) -> Result<Vec<u8>, String> {
     let mut last_error = None;
     for index in 0..state.manager.len() {
@@ -350,15 +663,14 @@ async fn tune_and_read(
             continue;
         }
 
-        let attempt = tokio::time::timeout(remaining(deadline)?, tune_on_tuner(state, scans, kind, logical, index, deadline)).await;
-        match attempt {
-            Ok(Ok(bytes)) => return Ok(bytes),
-            Ok(Err(error)) if error == "scan cancelled" => return Err(error),
-            Ok(Err(error)) => last_error = Some(error),
-            Err(_) => {
-                last_error = Some("channel scan timeout".to_owned());
-                break;
-            }
+        // `tune_on_tuner` owns a scan lease and performs synchronous cleanup
+        // before returning.  Do not wrap the whole future in another timeout:
+        // cancelling it at the channel deadline would run `Drop` cleanup in
+        // the background and reintroduce the single-tuner starvation bug.
+        match tune_on_tuner(state, scans, scan_generation, kind, logical, index, deadline, service_type, scan_mode).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) if error == "scan cancelled" => return Err(error),
+            Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.unwrap_or_else(|| TunerError::Busy("no compatible tuner available".to_owned()).to_string()))
@@ -367,18 +679,19 @@ async fn tune_and_read(
 async fn tune_on_tuner(
     state: &Arc<AppState>,
     scans: &Arc<ScanManager>,
+    scan_generation: ScanGeneration,
     kind: ChannelType,
     logical: &str,
     index: usize,
     deadline: Instant,
+    service_type: Option<i64>,
+    scan_mode: Option<ScanMode>,
 ) -> Result<Vec<u8>, String> {
     enum ScanInput {
-        Stdout(tokio::process::ChildStdout),
         Shared(mpsc::Receiver<Vec<u8>>),
     }
 
-    let scan_channel = state.channels.iter()
-        .find(|channel| channel.channel_type == kind && channel.channel == logical)
+    let scan_channel = configured_channel_for(&state.channels, kind, logical)
         .cloned()
         .unwrap_or(Channel { name: String::new(), channel_type: kind, channel: logical.to_owned(), serviceId: None, tunerChannels: None, extra: HashMap::new() });
     let physical = tokio::time::timeout(remaining(deadline)?, state.manager.physical_channel_for(index, &scan_channel))
@@ -396,19 +709,43 @@ async fn tune_on_tuner(
             .await
             .map_err(|_| "channel scan timeout".to_owned())?
         {
-            Ok((_pid, generation)) => match tokio::time::timeout(
-                remaining(deadline)?,
-                state.manager.create_subscription_for_generation(index, generation),
-            )
-            .await
-            .map_err(|_| "channel scan timeout".to_owned())?
-            {
-                Ok(receiver) => Some((ScanLease { manager: state.manager.clone(), index, generation, released: false }, ScanInput::Shared(receiver))),
-                Err(error) => {
-                    release_generation_with_deadline(&state.manager, index, generation, deadline).await;
+            Ok((_pid, process_generation)) => {
+                let subscription_budget = match remaining(deadline) {
+                    Ok(budget) => budget,
+                    Err(error) => {
+                        release_process_lease_with_deadline(
+                            &state.manager,
+                            index,
+                            process_generation,
+                            deadline,
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
+                match tokio::time::timeout(
+                    subscription_budget,
+                    state.manager.create_scan_subscription_for_generation(index, process_generation),
+                )
+                .await
+                {
+                Ok(Ok(receiver)) => Some((ScanLease { manager: state.manager.clone(), index, process_generation, release_state: Arc::new(AtomicU8::new(LEASE_OWNED)) }, ScanInput::Shared(receiver))),
+                Err(_) => {
+                    release_process_lease_with_deadline(
+                        &state.manager,
+                        index,
+                        process_generation,
+                        deadline,
+                    )
+                    .await;
+                    return Err("channel scan timeout".to_owned());
+                }
+                Ok(Err(error)) => {
+                    release_process_lease_with_deadline(&state.manager, index, process_generation, deadline).await;
                     return Err(error);
                 }
-            },
+                }
+            }
             Err(error) if error.is_busy() => None,
             Err(error) => return Err(error.to_string()),
         }
@@ -436,9 +773,44 @@ async fn tune_on_tuner(
             });
             "channel scan timeout".to_owned()
         })?;
-        let (_pid, generation) = started.map_err(|error| error.to_string())?;
-        let mut lease = ScanLease { manager: state.manager.clone(), index, generation, released: false };
-        let stdout = match tokio::time::timeout(remaining(deadline)?, state.manager.take_stdout(index)).await {
+        let (_pid, process_generation) = started.map_err(|error| error.to_string())?;
+        let mut lease = ScanLease { manager: state.manager.clone(), index, process_generation, release_state: Arc::new(AtomicU8::new(LEASE_OWNED)) };
+        // A scan that starts a process must use the same fan-out path as an
+        // HTTP stream.  Otherwise a later HTTP subscriber can attach to a
+        // process whose stdout is still owned by the scanner and wait
+        // forever.  Attach the scan subscription before handing stdout to
+        // the pump so no bytes are produced without a reader.
+        let subscription_budget = match remaining(deadline) {
+            Ok(budget) => budget,
+            Err(error) => {
+                release_with_deadline(&mut lease, deadline).await;
+                return Err(error);
+            }
+        };
+        let receiver = match tokio::time::timeout(
+            subscription_budget,
+            state.manager.create_scan_subscription_for_generation(index, process_generation),
+        )
+        .await
+        {
+            Ok(Ok(receiver)) => receiver,
+            Err(_) => {
+                release_with_deadline(&mut lease, deadline).await;
+                return Err("channel scan timeout".to_owned());
+            }
+            Ok(Err(error)) => {
+                release_with_deadline(&mut lease, deadline).await;
+                return Err(error);
+            }
+        };
+        let stdout_budget = match remaining(deadline) {
+            Ok(budget) => budget,
+            Err(error) => {
+                release_with_deadline(&mut lease, deadline).await;
+                return Err(error);
+            }
+        };
+        let stdout = match tokio::time::timeout(stdout_budget, state.manager.take_stdout(index)).await {
             Ok(Ok(Some(stdout))) => stdout,
             Ok(Ok(None)) => {
                 release_with_deadline(&mut lease, deadline).await;
@@ -449,48 +821,61 @@ async fn tune_on_tuner(
                 return Err(error);
             }
             Err(_) => {
-                drop(lease);
+                release_with_deadline(&mut lease, deadline).await;
                 return Err("channel scan timeout".to_owned());
             }
         };
-        (lease, ScanInput::Stdout(stdout))
+        state.manager.spawn_pump(index, stdout);
+        (lease, ScanInput::Shared(receiver))
     };
 
-    let read_result = tokio::time::timeout(remaining(deadline)?, async {
+    let mut cancel = scans.cancellation_receiver();
+    let read_budget = match remaining(deadline) {
+        Ok(budget) => budget,
+        Err(error) => {
+            release_with_deadline(&mut lease, deadline).await;
+            return Err(error);
+        }
+    };
+    let read_result = tokio::time::timeout(read_budget, async {
             let mut bytes = Vec::new();
             let mut ts = (kind != ChannelType::BS4K).then(TsScanBuffer::default);
-            let mut buf = [0u8; 8192];
+            #[cfg(test)]
+            let mut read_barrier_waited = false;
             loop {
-                match &mut input {
-                    ScanInput::Stdout(stdout) => tokio::select! {
-                        _ = scans.cancel_notify.notified() => return Err("scan cancelled".to_owned()),
-                        result = stdout.read(&mut buf) => {
-                            let count = result.map_err(|e| e.to_string())?;
-                            if count == 0 { break; }
-                            if let Some(ts) = ts.as_mut() {
-                                ts.feed(&buf[..count]);
-                            } else {
-                                bytes.extend_from_slice(&buf[..count]);
-                            }
-                        },
-                    },
-                    ScanInput::Shared(receiver) => tokio::select! {
-                        _ = scans.cancel_notify.notified() => return Err("scan cancelled".to_owned()),
-                        result = receiver.recv() => {
-                            let Some(chunk) = result else { break; };
-                            if let Some(ts) = ts.as_mut() {
-                                ts.feed(&chunk);
-                            } else {
-                                bytes.extend_from_slice(&chunk);
-                            }
+                if scans.is_cancelled_generation(scan_generation).await {
+                    return Err("scan cancelled".to_owned());
+                }
+                #[cfg(test)]
+                if !read_barrier_waited {
+                    read_barrier_waited = true;
+                    let barrier = scans.read_barrier.lock().await.clone();
+                    if let Some(barrier) = barrier {
+                    barrier.reached.notify_one();
+                    barrier.release.notified().await;
+                    }
+                }
+                let ScanInput::Shared(receiver) = &mut input;
+                tokio::select! {
+                    _ = scans.cancel_notify.notified() => return Err("scan cancelled".to_owned()),
+                    _ = cancel.changed() => return Err("scan cancelled".to_owned()),
+                    result = receiver.recv() => {
+                        let Some(chunk) = result else { break; };
+                        if let Some(ts) = ts.as_mut() {
+                            ts.feed(&chunk);
+                        } else {
+                            bytes.extend_from_slice(&chunk);
                         }
-                    },
+                    }
+                }
+                if scans.is_cancelled_generation(scan_generation).await {
+                    return Err("scan cancelled".to_owned());
                 }
                 let candidate = ts
                     .as_ref()
                     .map(|buffer| buffer.packets.as_slice())
                     .unwrap_or(bytes.as_slice());
-                if !candidate.is_empty() && !detect_scan_services(kind, logical, candidate, &state.channels).is_empty() {
+                if !candidate.is_empty() && !detect_scan_services_filtered(kind, logical, candidate, &state.channels, service_type, scan_mode).is_empty() {
                     break;
                 }
                 if bytes.len() >= 4 * 1024 * 1024 || ts.as_ref().is_some_and(|buffer| buffer.packets.len() >= 4 * 1024 * 1024) {
@@ -507,7 +892,7 @@ async fn tune_on_tuner(
                 return Err("scanner reached EOF before data".to_owned());
             }
             if kind != ChannelType::BS4K
-                && detect_scan_services(kind, logical, &bytes, &state.channels).is_empty()
+                && detect_scan_services_filtered(kind, logical, &bytes, &state.channels, service_type, scan_mode).is_empty()
             {
                 return Err("no valid services: PAT, NIT actual, and SDT actual are incomplete".to_owned());
             }
@@ -577,16 +962,35 @@ fn valid_ts_packet(packet: &[u8]) -> bool {
 
 pub fn detect_services(kind: ChannelType, logical: &str, bytes: &[u8], old: &[Channel]) -> Vec<Channel> {
     if kind == ChannelType::BS4K {
-        return detect_bs4k_services(logical, bytes, old);
+        return detect_bs4k_services(logical, bytes, old, None, ScanMode::Channel);
     }
+    detect_ts_services(kind, logical, bytes, old, None, None, ScanMode::Channel)
+}
+
+const MIRAKURUN_SCAN_SERVICE_TYPES: &[i64] = &[0x01, 0x02, 0xA1, 0xA4, 0xA5, 0xAD, 0xC0];
+
+fn detect_ts_services(
+    kind: ChannelType,
+    logical: &str,
+    bytes: &[u8],
+    old: &[Channel],
+    allowed_service_types: Option<&[i64]>,
+    service_type: Option<i64>,
+    _scan_mode: ScanMode,
+) -> Vec<Channel> {
     let sections = assemble_psi(bytes);
     let mut programs = pat_programs(&sections);
     let services = sdt_services(&sections);
     if programs.is_empty() { return Vec::new(); }
+    if let Some(allowed) = allowed_service_types {
+        programs.retain(|service_id| services.get(service_id).is_some_and(|(_, service_type)| allowed.contains(service_type)));
+    }
+    if let Some(wanted) = service_type {
+        programs.retain(|service_id| services.get(service_id).is_some_and(|(_, detected_type)| *detected_type == wanted));
+    }
+    if programs.is_empty() { return Vec::new(); }
     programs.sort_unstable();
-    let old_channel = old
-        .iter()
-        .find(|channel| channel.channel_type == kind && channel.channel == logical);
+    let old_channel = configured_channel_for(old, kind, logical);
     let network_id = nit_network_id(&sections).unwrap_or_else(|| {
         old_channel
             .and_then(|channel| channel.extra.get("networkId"))
@@ -614,7 +1018,15 @@ pub fn detect_services(kind: ChannelType, logical: &str, bytes: &[u8], old: &[Ch
     // retained in the same physical-channel record, alongside newly detected
     // programs.
     if let Some(existing_service_id) = old_channel.and_then(|channel| channel.serviceId) {
-        if !detected.iter().any(|service| service.serviceId == existing_service_id) {
+        let existing_service_type = old_channel
+            .and_then(|channel| channel.extra.get("serviceType"))
+            .and_then(|value| value.as_i64());
+        let old_primary_matches_filters = allowed_service_types.is_none_or(|allowed| {
+            existing_service_type.is_some_and(|service_type| allowed.contains(&service_type))
+        }) && service_type.is_none_or(|wanted| existing_service_type == Some(wanted));
+        if !detected.iter().any(|service| service.serviceId == existing_service_id)
+            && old_primary_matches_filters
+        {
             detected.insert(0, ChannelService {
                 serviceId: existing_service_id,
                 networkId: old_channel
@@ -632,6 +1044,8 @@ pub fn detect_services(kind: ChannelType, logical: &str, bytes: &[u8], old: &[Ch
 
     // One physical channel is one Channel record.  Preserve the configured
     // primary service/name and carry all other PAT programs in `extra.services`.
+    // This is also the Service-mode representation: Mirakurun keeps the
+    // logical channel in `channel` and stores the serviceId separately.
     let Some(primary) = old_channel
         .and_then(|channel| channel.serviceId)
         .and_then(|service_id| detected.iter().find(|service| service.serviceId == service_id).cloned())
@@ -639,6 +1053,7 @@ pub fn detect_services(kind: ChannelType, logical: &str, bytes: &[u8], old: &[Ch
         return Vec::new();
     };
     let mut extra = old_channel.map(|channel| channel.extra.clone()).unwrap_or_default();
+    extra.remove("physicalChannel");
     extra.insert("networkId".to_owned(), serde_json::json!(primary.networkId));
     extra.insert("serviceType".to_owned(), serde_json::json!(primary.service_type));
     let additional = detected
@@ -654,6 +1069,7 @@ pub fn detect_services(kind: ChannelType, logical: &str, bytes: &[u8], old: &[Ch
     }
     vec![Channel {
         name: old_channel
+            .filter(|channel| channel.serviceId == Some(primary.serviceId))
             .map(|channel| channel.name.clone())
             .unwrap_or(primary.name),
         channel_type: kind,
@@ -667,7 +1083,14 @@ pub fn detect_services(kind: ChannelType, logical: &str, bytes: &[u8], old: &[Ch
 /// The scan path is stricter than the public detector compatibility helper:
 /// PAT alone is not a usable channel record.  Require the actual NIT and the
 /// actual SDT to describe every PAT service before allowing persistence.
-fn detect_scan_services(kind: ChannelType, logical: &str, bytes: &[u8], old: &[Channel]) -> Vec<Channel> {
+fn detect_scan_services_filtered(
+    kind: ChannelType,
+    logical: &str,
+    bytes: &[u8],
+    old: &[Channel],
+    service_type: Option<i64>,
+    scan_mode: Option<ScanMode>,
+) -> Vec<Channel> {
     if kind != ChannelType::BS4K {
         let sections = assemble_psi(bytes);
         let programs = pat_programs(&sections);
@@ -680,7 +1103,11 @@ fn detect_scan_services(kind: ChannelType, logical: &str, bytes: &[u8], old: &[C
             return Vec::new();
         }
     }
-    detect_services(kind, logical, bytes, old)
+    if kind == ChannelType::BS4K {
+        detect_bs4k_services(logical, bytes, old, service_type, scan_mode.unwrap_or_else(|| default_scan_mode(kind)))
+    } else {
+        detect_ts_services(kind, logical, bytes, old, Some(MIRAKURUN_SCAN_SERVICE_TYPES), service_type, scan_mode.unwrap_or_else(|| default_scan_mode(kind)))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -725,7 +1152,7 @@ struct MmtFragment {
 /// three tables deliberately remain independent until the end: a name or a
 /// service id from an unrelated/other table is never enough to create a
 /// channel.
-fn detect_bs4k_services(logical: &str, bytes: &[u8], old: &[Channel]) -> Vec<Channel> {
+fn detect_bs4k_services(logical: &str, bytes: &[u8], old: &[Channel], service_type: Option<i64>, _scan_mode: ScanMode) -> Vec<Channel> {
     let mut nit_sections: HashMap<(u16, u8, bool), HashMap<u8, TlvNitSection>> = HashMap::new();
     let mut package_ids = HashSet::new();
     let mut services = Vec::new();
@@ -771,6 +1198,7 @@ fn detect_bs4k_services(logical: &str, bytes: &[u8], old: &[Channel]) -> Vec<Cha
             package_ids.contains(&service.service_id)
                 && service.network_id == nit.network_id
                 && nit.streams.get(&service.stream_id) == Some(&service.network_id)
+                && service_type.is_none_or(|wanted| service.service_type == wanted)
         })
         .map(|service| ChannelService {
             serviceId: i64::from(service.service_id),
@@ -785,9 +1213,7 @@ fn detect_bs4k_services(logical: &str, bytes: &[u8], old: &[Channel]) -> Vec<Cha
 }
 
 fn bs4k_channel(logical: &str, old: &[Channel], detected: Vec<ChannelService>) -> Vec<Channel> {
-    let old_channel = old
-        .iter()
-        .find(|channel| channel.channel_type == ChannelType::BS4K && channel.channel == logical);
+    let old_channel = configured_channel_for(old, ChannelType::BS4K, logical);
     let Some(primary) = old_channel
         .and_then(|channel| channel.serviceId)
         .and_then(|service_id| detected.iter().find(|service| service.serviceId == service_id).cloned())
@@ -807,7 +1233,10 @@ fn bs4k_channel(logical: &str, old: &[Channel], detected: Vec<ChannelService>) -
         extra.insert("services".to_owned(), value);
     }
     vec![Channel {
-        name: old_channel.map(|channel| channel.name.clone()).unwrap_or(primary.name),
+        name: old_channel
+            .filter(|channel| channel.serviceId == Some(primary.serviceId))
+            .map(|channel| channel.name.clone())
+            .unwrap_or(primary.name),
         channel_type: ChannelType::BS4K,
         channel: logical.to_owned(),
         serviceId: Some(primary.serviceId),
@@ -1079,7 +1508,7 @@ fn decode_service_name(bytes: &[u8]) -> String {
 
 fn nit_network_id(sections: &HashMap<u16, Vec<Vec<u8>>>) -> Option<u16> {
     sections.get(&0x10)?.iter().find_map(|section| {
-        (section.first() == Some(&0x40) && section.len() >= 5)
+        (section.first() == Some(&0x40) && section.len() >= 6 && section[5] & 1 != 0)
             .then(|| u16::from_be_bytes([section[3], section[4]]))
     })
 }
@@ -1088,7 +1517,7 @@ fn pat_programs(sections: &HashMap<u16, Vec<Vec<u8>>>) -> Vec<u16> {
     let mut result = HashSet::new();
     for section in sections.get(&0).into_iter().flatten() {
         if section.first() != Some(&0x00) { continue; }
-        if section.len() < 8 { continue; }
+        if section.len() < 8 || section[5] & 1 == 0 { continue; }
         let end = section.len().saturating_sub(4);
         let mut at = 8;
         while at + 4 <= end { let service = u16::from_be_bytes([section[at], section[at + 1]]); if service != 0 { result.insert(service); } at += 4; }
@@ -1099,7 +1528,7 @@ fn pat_programs(sections: &HashMap<u16, Vec<Vec<u8>>>) -> Vec<u16> {
 fn sdt_services(sections: &HashMap<u16, Vec<Vec<u8>>>) -> HashMap<u16, (String, i64)> {
     let mut result = HashMap::new();
     for section in sections.get(&0x11).into_iter().flatten() {
-        if section.first() != Some(&0x42) || section.len() < 11 { continue; }
+        if section.first() != Some(&0x42) || section.len() < 11 || section[5] & 1 == 0 { continue; }
         let end = section.len().saturating_sub(4); let mut at = 11;
         while at + 5 <= end { let service = u16::from_be_bytes([section[at], section[at + 1]]); let descriptors = (((section[at + 3] & 0x0f) as usize) << 8) | section[at + 4] as usize; let stop = (at + 5 + descriptors).min(end); let mut descriptor = at + 5;
             while descriptor + 2 <= stop {
@@ -1211,18 +1640,104 @@ fn assemble_psi(bytes: &[u8]) -> HashMap<u16, Vec<Vec<u8>>> {
     sections
 }
 
-fn merge_channels(existing: &[Channel], found: Vec<Channel>, types: &[ChannelType], refresh: bool) -> Result<Vec<Channel>, String> {
+#[cfg(test)]
+fn merge_channels(
+    existing: &[Channel],
+    found: Vec<Channel>,
+    types: &[ChannelType],
+    refresh: bool,
+    _service_type: Option<i64>,
+    _scan_mode: Option<ScanMode>,
+) -> Result<Vec<Channel>, String> {
+    merge_channels_with_targets(existing, found, types, refresh, _service_type, _scan_mode, None)
+}
+
+fn merge_channels_with_targets(
+    existing: &[Channel],
+    found: Vec<Channel>,
+    types: &[ChannelType],
+    refresh: bool,
+    _service_type: Option<i64>,
+    _scan_mode: Option<ScanMode>,
+    target_sets: Option<&HashMap<ChannelType, HashSet<String>>>,
+) -> Result<Vec<Channel>, String> {
     crate::config::validate_channel_pairs(existing).map_err(|errors| errors.join("; "))?;
     crate::config::validate_channel_pairs(&found).map_err(|errors| errors.join("; "))?;
     let selected: HashSet<_> = types.iter().copied().collect();
-    let found_keys: HashSet<_> = found.iter().map(|channel| (channel.channel_type, channel.channel.clone())).collect();
+    let found_physical: HashSet<_> = found.iter()
+        .map(|channel| (channel.channel_type, logical_channel(channel)))
+        .collect();
     let mut result = existing.iter().filter(|channel| {
-        !selected.contains(&channel.channel_type) || !refresh || found_keys.contains(&(channel.channel_type, channel.channel.clone()))
+        if !selected.contains(&channel.channel_type) {
+            return true;
+        }
+        // The request's target set defines the selected range.  Records outside
+        // it are removed even when refresh=false; records inside it are kept
+        // without rescanning.  Other channel types are untouched.
+        let targets = target_sets
+            .and_then(|sets| sets.get(&channel.channel_type))
+            .cloned()
+            .unwrap_or_else(|| scan_targets(channel.channel_type, existing).into_iter().collect());
+        if !targets.contains(&logical_channel(channel)) {
+            return false;
+        }
+        if !refresh {
+            // Existing records for an in-range target are authoritative.  In
+            // particular, do not replace a configured service list or tuner
+            // mapping merely because refresh was omitted.
+            return true;
+        }
+        let physical = (channel.channel_type, logical_channel(channel));
+        // A refresh replaces stale legacy `logical:serviceId` records, while
+        // retaining the logical-channel record long enough to merge manual
+        // fields such as tunerChannels into the newly detected result.
+        found_physical.contains(&physical) && !is_service_entry(channel)
     }).cloned().collect::<Vec<_>>();
-    for channel in found { if let Some(previous) = result.iter_mut().find(|old| old.channel_type == channel.channel_type && old.channel == channel.channel) { let name = previous.name.clone(); *previous = channel; previous.name = name; } else { result.push(channel); } }
+    for channel in found {
+        if !refresh && result.iter().any(|old| {
+            old.channel_type == channel.channel_type && logical_channel(old) == logical_channel(&channel)
+        }) {
+            continue;
+        }
+        if let Some(previous) = result.iter_mut().find(|old| {
+            old.channel_type == channel.channel_type && old.channel == channel.channel
+        }) {
+            // The detector works from the startup snapshot, while a manual
+            // PUT may have changed this record before commit.  Keep manual
+            // fields from the latest file and replace only SI discovered by
+            // the scan.  In particular, never restore a stale tunerChannels
+            // map (or a manual `disabled`/unknown extension) from `found`.
+            let manual_name = previous.name.clone();
+            let manual_tuner_channels = previous.tunerChannels.clone();
+            let manual_extra = previous.extra.clone();
+            let mut updated = channel;
+            updated.name = manual_name;
+            updated.tunerChannels = manual_tuner_channels;
+            let mut extra = manual_extra;
+            for key in ["networkId", "serviceType", "services"] {
+                match updated.extra.get(key) {
+                    Some(value) => {
+                        extra.insert(key.to_owned(), value.clone());
+                    }
+                    None => {
+                        extra.remove(key);
+                    }
+                }
+            }
+            updated.extra = extra;
+            *previous = updated;
+        } else {
+            result.push(channel);
+        }
+    }
     crate::config::validate_channel_pairs(&result).map_err(|errors| errors.join("; "))?;
     crate::config::validate_service_item_ids(&result).map_err(|errors| format!("invalid ServiceItemId: {}", errors.join("; ")))?;
     Ok(result)
+}
+
+fn is_service_entry(channel: &Channel) -> bool {
+    channel.serviceId.is_some() && channel.channel.rsplit_once(':')
+        .is_some_and(|(_, suffix)| suffix.parse::<i64>().ok() == channel.serviceId)
 }
 
 fn epoch_seconds() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_secs()).unwrap_or_default() }
@@ -1236,9 +1751,281 @@ mod tests {
     #[test]
     fn scan_ranges_match_specification() {
         assert_eq!(scan_channels(ChannelType::GR).len(), 50);
-        assert_eq!(scan_channels(ChannelType::BS).len(), 92);
+        assert_eq!(scan_channels(ChannelType::BS).len(), 248);
+        assert_eq!(scan_channels(ChannelType::BS).first().map(String::as_str), Some("BS01_0"));
+        assert_eq!(scan_channels(ChannelType::BS).get(91).map(String::as_str), Some("BS23_3"));
+        assert_eq!(scan_channels(ChannelType::BS).get(92).map(String::as_str), Some("101"));
+        assert_eq!(scan_channels(ChannelType::BS).last().map(String::as_str), Some("256"));
+        let configured_bs = vec![
+            Channel { name: "legacy".into(), channel_type: ChannelType::BS, channel: "BS-legacy".into(), serviceId: None, tunerChannels: None, extra: HashMap::new() },
+            Channel { name: "duplicate".into(), channel_type: ChannelType::BS, channel: "101".into(), serviceId: None, tunerChannels: None, extra: HashMap::new() },
+        ];
+        let bs_targets = scan_targets(ChannelType::BS, &configured_bs);
+        assert_eq!(bs_targets.len(), 249);
+        assert_eq!(bs_targets.last().map(String::as_str), Some("BS-legacy"));
         assert_eq!(scan_channels(ChannelType::CS).len(), 23);
         assert_eq!(scan_channels(ChannelType::BS4K), vec!["BS4K45328"]);
+        let configured = vec![
+            Channel { name: "AT-X".into(), channel_type: ChannelType::SKY, channel: "ATXHD".into(), serviceId: None, tunerChannels: None, extra: HashMap::new() },
+            Channel { name: "SPOTV".into(), channel_type: ChannelType::SKY, channel: "CH585".into(), serviceId: None, tunerChannels: None, extra: HashMap::new() },
+        ];
+        assert_eq!(scan_channels(ChannelType::SKY), Vec::<String>::new());
+        assert_eq!(scan_targets(ChannelType::SKY, &configured), ["ATXHD", "CH585"]);
+        assert_eq!(default_scan_types(&[]), vec![ChannelType::GR, ChannelType::BS, ChannelType::CS, ChannelType::BS4K]);
+        assert_eq!(default_scan_types(&configured), vec![ChannelType::GR, ChannelType::BS, ChannelType::CS, ChannelType::SKY, ChannelType::BS4K]);
+        assert_eq!(default_scan_mode(ChannelType::GR), ScanMode::Channel);
+        for kind in [ChannelType::BS, ChannelType::CS, ChannelType::SKY, ChannelType::BS4K] {
+            assert_eq!(default_scan_mode(kind), ScanMode::Service);
+        }
+    }
+
+    #[test]
+    fn service_refresh_keeps_one_logical_channel_with_all_services() {
+        let aggregate = Channel {
+            name: "aggregate".into(),
+            channel_type: ChannelType::SKY,
+            channel: "CH585".into(),
+            serviceId: Some(101),
+            tunerChannels: Some(HashMap::from([("fixture".into(), "13".into())])),
+            extra: HashMap::from([(String::from("services"), serde_json::json!([]))]),
+        };
+        let service = Channel {
+            name: "service".into(),
+            channel_type: ChannelType::SKY,
+            channel: "CH585".into(),
+            serviceId: Some(101),
+            tunerChannels: Some(HashMap::from([("fixture".into(), "13".into())])),
+            extra: HashMap::from([
+                (String::from("networkId"), serde_json::json!(1)),
+                (String::from("services"), serde_json::json!([{
+                    "serviceId": 202,
+                    "networkId": 1,
+                    "name": "second",
+                    "serviceType": 2,
+                }])),
+            ]),
+        };
+        let service_result = merge_channels(
+            &[aggregate], vec![service.clone()], &[ChannelType::SKY], true, None, Some(ScanMode::Service),
+        ).unwrap();
+        assert_eq!(service_result.len(), 1);
+        assert_eq!(service_result[0].channel, "CH585");
+        assert_eq!(service_result[0].extra["services"][0]["serviceId"], 202);
+        assert!(validate_no_duplicate_services(&service_result));
+
+        let channel_result = merge_channels(
+            &service_result, vec![Channel { channel: "CH585".into(), ..service.clone() }],
+            &[ChannelType::SKY], true, None, Some(ScanMode::Channel),
+        ).unwrap();
+        assert_eq!(channel_result.len(), 1);
+        assert_eq!(channel_result[0].channel, "CH585");
+        assert!(validate_no_duplicate_services(&channel_result));
+    }
+
+    #[test]
+    fn non_refresh_keeps_only_selected_targets_and_current_scan_mode() {
+        let channel = |kind, logical: &str, service_id: Option<i64>| Channel {
+            name: logical.to_owned(),
+            channel_type: kind,
+            channel: service_id.map_or_else(|| logical.to_owned(), |id| format!("{logical}:{id}")),
+            serviceId: service_id,
+            tunerChannels: None,
+            extra: HashMap::new(),
+        };
+        let existing = vec![
+            channel(ChannelType::GR, "13", None),
+            channel(ChannelType::GR, "99", None),
+            channel(ChannelType::GR, "14", Some(999)),
+            channel(ChannelType::BS, "101", None),
+            channel(ChannelType::CS, "CS2", None),
+            channel(ChannelType::SKY, "CH585", Some(101)),
+            channel(ChannelType::BS4K, "BS4K45328", Some(202)),
+        ];
+        let found = Vec::new();
+        let merged = merge_channels(
+            &existing,
+            found,
+            &[ChannelType::GR],
+            false,
+            None,
+            Some(ScanMode::Channel),
+        )
+        .unwrap();
+        assert!(merged.iter().any(|item| item.channel_type == ChannelType::GR && item.channel == "13" && item.serviceId.is_none()));
+        assert!(!merged.iter().any(|item| item.channel_type == ChannelType::GR && item.channel == "99"));
+        assert!(!merged.iter().any(|item| item.channel_type == ChannelType::GR && item.channel == "14" && item.serviceId.is_some()));
+        assert!(merged.iter().any(|item| item.channel_type == ChannelType::BS));
+        assert!(merged.iter().any(|item| item.channel_type == ChannelType::CS));
+        assert!(merged.iter().any(|item| item.channel_type == ChannelType::SKY));
+        assert!(merged.iter().any(|item| item.channel_type == ChannelType::BS4K));
+    }
+
+    fn validate_no_duplicate_services(channels: &[Channel]) -> bool {
+        crate::config::validate_channel_pairs(channels).is_ok()
+            && crate::config::validate_service_item_ids(channels).is_ok()
+    }
+
+    #[tokio::test]
+    async fn scan_commit_reloads_manual_channel_changes_after_waiting_for_put_lock() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("hotarun-scan-put-race-{suffix}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&directory.join("channels.yml"), "- name: original\n  type: SKY\n  channel: CH585\n").unwrap();
+        let state = Arc::new(AppState::load_from_dir(&directory));
+        {
+            let mut scan_state = state.scan.state.lock().await;
+            scan_state.task_running = true;
+            scan_state.scan_generation = ScanGeneration(1);
+            scan_state.status.status = "running".to_owned();
+        }
+        let config_lock = state.channel_config_lock.lock().await;
+        let commit = tokio::spawn({
+            let scan = Arc::clone(&state.scan);
+            let channels = state.channels.clone();
+            let directory = directory.clone();
+            let lock = Arc::clone(&state.channel_config_lock);
+            async move {
+                scan.commit(
+                    ScanGeneration(1), &channels,
+                    vec![Channel { name: "scanned".into(), channel_type: ChannelType::SKY, channel: "CH585".into(), serviceId: None, tunerChannels: None, extra: HashMap::new() }],
+                    &[ChannelType::SKY], true, None, Some(ScanMode::Channel), HashMap::new(), false,
+                    Some(directory.as_path()), Some(lock),
+                ).await
+            }
+        });
+        tokio::task::yield_now().await;
+        std::fs::write(&directory.join("channels.yml"), "- name: manual\n  type: GR\n  channel: 27\n").unwrap();
+        std::mem::drop(config_lock);
+        let merged = commit.await.unwrap().unwrap();
+        assert!(merged.iter().any(|channel| channel.channel_type == ChannelType::GR && channel.channel == "27"));
+        assert!(merged.iter().any(|channel| channel.channel_type == ChannelType::SKY && channel.channel == "CH585"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn scan_test_manager() -> crate::tuner::SharedTunerManager {
+        crate::tuner::TunerManager::shared(vec![crate::config::Tuner {
+            name: "scan-test".to_owned(),
+            types: vec![ChannelType::GR],
+            command: Some(crate::tuner::process::test_fixture_command("hold")),
+            tlv_decoder: None,
+            decoder: None,
+            extra: HashMap::new(),
+        }])
+    }
+
+    #[tokio::test]
+    async fn scan_lease_drop_after_expired_release_deadline_releases_once() {
+        let manager = scan_test_manager();
+        let (_pid, generation) = manager.acquire_with_priority(0, "13", 0).await.unwrap();
+        let mut lease = ScanLease { manager: manager.clone(), index: 0, process_generation: generation, release_state: Arc::new(AtomicU8::new(LEASE_OWNED)) };
+
+        release_with_deadline(&mut lease, Instant::now()).await;
+        assert_eq!(lease.release_state.load(Ordering::Acquire), LEASE_RELEASED);
+        let (_pid, stream_generation) = manager.acquire_with_priority(0, "13", 10).await.unwrap();
+        assert_eq!(manager.use_count(0).await.unwrap(), 1);
+        drop(lease);
+        manager.release_lease(0, stream_generation, Some(10)).await.unwrap();
+        manager.stop(0).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scan_release_reclaims_a_single_tuner_before_the_next_target() {
+        let manager = scan_test_manager();
+        let (_pid, generation) = manager.acquire_with_priority(0, "13", 0).await.unwrap();
+        let mut lease = ScanLease { manager: manager.clone(), index: 0, process_generation: generation, release_state: Arc::new(AtomicU8::new(LEASE_OWNED)) };
+
+        release_with_deadline(&mut lease, Instant::now()).await;
+        tokio::time::timeout(Duration::from_secs(1), manager.wait_for_idle(0))
+            .await
+            .expect("scan release did not reclaim tuner")
+            .unwrap();
+        let (_pid, next_generation) = manager.acquire_with_priority(0, "14", 0).await.unwrap();
+        assert_ne!(next_generation, generation);
+        manager.release_lease_immediately(0, next_generation, Some(0)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scan_release_keeps_a_shared_http_process_alive() {
+        let manager = scan_test_manager();
+        let (_pid, http_generation) = manager.acquire_with_priority(0, "13", 10).await.unwrap();
+        let (_pid, scan_generation) = manager.acquire_with_priority(0, "13", 0).await.unwrap();
+        manager.release_lease_immediately(0, scan_generation, Some(0)).await.unwrap();
+        assert_eq!(manager.use_count(0).await.unwrap(), 1);
+        assert_eq!(manager.pid(0).await.unwrap().is_some(), true);
+        manager.release_lease_immediately(0, http_generation, Some(10)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scan_lease_release_competes_with_stream_acquire_without_stopping_use() {
+        let manager = scan_test_manager();
+        let (_pid, generation) = manager.acquire_with_priority(0, "13", 0).await.unwrap();
+        let mut lease = ScanLease { manager: manager.clone(), index: 0, process_generation: generation, release_state: Arc::new(AtomicU8::new(LEASE_OWNED)) };
+
+        let release = release_with_deadline(&mut lease, Instant::now() + Duration::from_secs(1));
+        let acquire = manager.acquire_with_priority(0, "13", 10);
+        let (_, acquire_result) = tokio::join!(release, acquire);
+        assert_eq!(lease.release_state.load(Ordering::Acquire), LEASE_RELEASED);
+        let (_pid, stream_generation) = acquire_result.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if manager.use_count(0).await.unwrap() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scan release cleanup timeout");
+        assert_eq!(manager.use_count(0).await.unwrap(), 1);
+        assert_eq!(manager.current_channel(0).await.unwrap().as_deref(), Some("13"));
+        drop(lease);
+        manager.release_lease(0, stream_generation, Some(10)).await.unwrap();
+        manager.stop(0).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_final_detection_cannot_commit_or_complete() {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("hotarun-scan-final-cancel-{suffix}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let scans = ScanManager::new();
+        let channel = Channel {
+            name: "SPOTV".to_owned(),
+            channel_type: ChannelType::SKY,
+            channel: "CH585".to_owned(),
+            serviceId: Some(101),
+            tunerChannels: None,
+            extra: HashMap::new(),
+        };
+        {
+            let mut state = scans.state.lock().await;
+            state.task_running = true;
+            state.scan_generation = ScanGeneration(1);
+            state.status.status = "running".to_owned();
+        }
+        let barrier = Arc::new(ScanCommitBarrier { reached: Notify::new(), release: Notify::new() });
+        *scans.commit_barrier.lock().await = Some(Arc::clone(&barrier));
+        let config_guard = Arc::new(Mutex::new(()));
+        let config_lock_guard = config_guard.lock().await;
+        let commit = tokio::spawn({
+            let scans = Arc::clone(&scans);
+            let directory = directory.clone();
+            let config_guard = Arc::clone(&config_guard);
+            async move {
+                scans
+                    .commit(ScanGeneration(1), &[], vec![channel], &[ChannelType::SKY], true, None, None, HashMap::new(), false, Some(directory.as_path()), Some(config_guard))
+                    .await
+            }
+        });
+        barrier.reached.notified().await;
+        assert!(scans.cancel().await.unwrap());
+        barrier.release.notify_one();
+        drop(config_lock_guard);
+        assert!(matches!(commit.await.unwrap(), Err(error) if error == "scan cancelled"));
+        let status = scans.status().await;
+        assert_eq!(status.status, "cancelled");
+        assert!(!directory.join("channels.yml").exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -1269,14 +2056,155 @@ mod tests {
         let result = tune_and_read(
             &state,
             &scans,
+            ScanGeneration(0),
             ChannelType::GR,
             "13",
             Instant::now() + Duration::from_millis(500),
+            None,
+            None,
         )
         .await;
         assert_eq!(result, Err("channel scan timeout".to_owned()));
         assert!(started.elapsed() < Duration::from_secs(1));
         state.manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_scan_channel_releases_the_tuner_for_the_next_channel() {
+        let state = Arc::new(AppState::from_lists(
+            Vec::new(),
+            vec![crate::config::Tuner {
+                name: "scan-test".to_owned(),
+                types: vec![ChannelType::GR],
+                command: Some(format!(
+                    "{} <channel>",
+                    crate::tuner::process::test_fixture_command("scan-timeout-then-success")
+                )),
+                tlv_decoder: None,
+                decoder: None,
+                extra: HashMap::new(),
+            }],
+        ));
+        let scans = ScanManager::new();
+        let first = tune_and_read(
+            &state,
+            &scans,
+            ScanGeneration(0),
+            ChannelType::GR,
+            "13",
+            Instant::now() + Duration::from_millis(100),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(first, Err("channel scan timeout".to_owned()));
+        assert_eq!(state.manager.pid(0).await.unwrap(), None);
+        assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
+
+        let second = tune_and_read(
+            &state,
+            &scans,
+            ScanGeneration(0),
+            ChannelType::GR,
+            "14",
+            Instant::now() + Duration::from_secs(2),
+            None,
+            None,
+        )
+        .await;
+        assert!(second.is_ok(), "next channel could not reuse tuner: {second:?}");
+        state.manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn overall_scan_timeout_waits_for_scanner_cleanup_before_reuse() {
+        let state = Arc::new(AppState::from_lists(
+            vec![Channel { name: "GR".into(), channel_type: ChannelType::GR, channel: "13".into(), serviceId: None, tunerChannels: None, extra: HashMap::new() }],
+            vec![crate::config::Tuner {
+                name: "scan".into(), types: vec![ChannelType::GR],
+                command: Some(crate::tuner::process::test_fixture_command("hold")),
+                tlv_decoder: None, decoder: None, extra: HashMap::new(),
+            }],
+        ));
+        let scans = ScanManager::new();
+        {
+            let mut current = scans.state.lock().await;
+            current.task_running = true;
+            current.scan_generation = ScanGeneration(1);
+            current.status.status = "running".to_owned();
+        }
+        let target_sets = [(ChannelType::GR, scan_targets(ChannelType::GR, &state.channels).into_iter().collect())]
+            .into_iter()
+            .collect();
+        let (_result, timed_out) = run_scan_with_timeout(
+            &state, &scans, ScanGeneration(1), &[ChannelType::GR], false, false,
+            true, Some(ScanMode::Channel), None, target_sets, Duration::from_millis(50),
+        )
+        .await;
+        assert!(timed_out);
+        tokio::time::timeout(Duration::from_secs(1), state.manager.wait_for_idle(0))
+            .await
+            .expect("overall timeout left scanner process busy")
+            .unwrap();
+        let (_pid, generation) = state.manager.start_with_priority(0, "13", 0).await.unwrap();
+        state.manager.release_lease_immediately(0, generation, Some(0)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_read_select_registration_wakes_scan_immediately() {
+        let state = Arc::new(AppState::from_lists(
+            Vec::new(),
+            vec![crate::config::Tuner {
+                name: "scan-test".to_owned(),
+                types: vec![ChannelType::GR],
+                command: Some(crate::tuner::process::test_fixture_command("hold")),
+                tlv_decoder: None,
+                decoder: None,
+                extra: HashMap::new(),
+            }],
+        ));
+        let scans = ScanManager::new();
+        {
+            let mut current = scans.state.lock().await;
+            current.task_running = true;
+            current.scan_generation = ScanGeneration(1);
+            current.status.status = "running".to_owned();
+        }
+        let barrier = Arc::new(ScanReadBarrier { reached: Notify::new(), release: Notify::new() });
+        *scans.read_barrier.lock().await = Some(Arc::clone(&barrier));
+
+        let scan = tokio::spawn({
+            let state = Arc::clone(&state);
+            let scans = Arc::clone(&scans);
+            async move {
+                tune_on_tuner(
+                    &state,
+                    &scans,
+                    ScanGeneration(1),
+                    ChannelType::GR,
+                    "13",
+                    0,
+                    Instant::now() + Duration::from_secs(20),
+                    None,
+                    None,
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), barrier.reached.notified())
+            .await
+            .expect("read loop did not reach the registration boundary");
+        assert!(scans.cancel().await.unwrap());
+        barrier.release.notify_one();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), scan)
+            .await
+            .expect("cancelled scan remained blocked in read select")
+            .unwrap();
+        assert_eq!(result, Err("scan cancelled".to_owned()));
+        state.manager.wait_for_idle(0).await.unwrap();
+        assert_eq!(state.manager.use_count(0).await.unwrap(), 0);
+        assert_eq!(state.manager.pid(0).await.unwrap(), None);
     }
 
     #[test]
@@ -1472,9 +2400,11 @@ mod tests {
         ];
         let pat_only = packet(0, &pat);
         let pat_nit = [pat_only.clone(), packet(0x10, &nit)].concat();
-        assert!(detect_scan_services(ChannelType::GR, "27", &pat_only, &[]).is_empty());
-        assert!(detect_scan_services(ChannelType::GR, "27", &pat_nit, &[]).is_empty());
-        assert!(!detect_scan_services(ChannelType::GR, "27", &[pat_nit, packet(0x11, &sdt)].concat(), &[]).is_empty());
+        assert!(detect_scan_services_filtered(ChannelType::GR, "27", &pat_only, &[], None, None).is_empty());
+        assert!(detect_scan_services_filtered(ChannelType::GR, "27", &pat_nit, &[], None, None).is_empty());
+        let complete = [pat_nit, packet(0x11, &sdt)].concat();
+        assert!(!detect_scan_services_filtered(ChannelType::GR, "27", &complete, &[], None, None).is_empty());
+        assert!(!detect_scan_services_filtered(ChannelType::SKY, "CH585", &complete, &[], None, None).is_empty());
     }
 
     #[test]
@@ -1530,6 +2460,111 @@ mod tests {
         assert_eq!(services.len(), 1);
         assert_eq!(services[0]["serviceId"], 202);
         assert_eq!(crate::routes::api::service_items(&found).len(), 2);
+    }
+
+    #[test]
+    fn ts_scan_service_type_filter_reselects_primary_when_old_primary_is_excluded() {
+        let pat = [
+            0x00, 0xb0, 0x11, 0, 1, 0xc1, 0, 0, 0, 101, 0xe1, 0,
+            0, 202, 0xe2, 0, 0, 0, 0, 0,
+        ];
+        let nit = [0x40, 0xb0, 0x09, 0x12, 0x34, 0xc1, 0, 0, 0, 0, 0, 0, 0];
+        fn packet(pid: u16, section: &[u8]) -> Vec<u8> {
+            let mut packet = vec![0xff; 188];
+            packet[..5].copy_from_slice(&[
+                0x47,
+                0x40 | ((pid >> 8) as u8 & 0x1f),
+                pid as u8,
+                0x10,
+                0,
+            ]);
+            packet[5..5 + section.len()].copy_from_slice(section);
+            packet
+        }
+        let mut sdt = vec![0x42, 0, 0, 0, 1, 0xc1, 0, 0, 0, 0, 0];
+        for (service, service_type, name) in [(101, 1, b"Old!".as_slice()), (202, 2, b"Target".as_slice())] {
+            sdt.extend_from_slice(&[
+                (service >> 8) as u8,
+                service as u8,
+                0xfc,
+                0xf0,
+                (name.len() + 5) as u8,
+                0x48,
+                (name.len() + 3) as u8,
+                service_type,
+                0,
+                name.len() as u8,
+            ]);
+            sdt.extend_from_slice(name);
+        }
+        let section_length = sdt.len() + 4 - 3;
+        sdt[1] = 0xb0 | ((section_length >> 8) as u8 & 0x0f);
+        sdt[2] = section_length as u8;
+        sdt.extend_from_slice(&[0, 0, 0, 0]);
+        let old = Channel {
+            name: "Configured old primary".into(),
+            channel_type: ChannelType::GR,
+            channel: "27".into(),
+            serviceId: Some(101),
+            tunerChannels: None,
+            extra: HashMap::from([(String::from("serviceType"), serde_json::json!(1))]),
+        };
+        let bytes = [packet(0, &pat), packet(0x10, &nit), packet(0x11, &sdt)].concat();
+        let found = detect_scan_services_filtered(ChannelType::GR, "27", &bytes, &[old], Some(2), None);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].serviceId, Some(202));
+        assert_eq!(found[0].name, "Target");
+        assert_eq!(found[0].extra["serviceType"], serde_json::json!(2));
+        assert!(found[0].extra.get("services").is_none());
+
+        let mut disallowed_old = found[0].clone();
+        disallowed_old.name = "Configured disallowed primary".into();
+        disallowed_old.serviceId = Some(999);
+        disallowed_old.extra.insert("serviceType".into(), serde_json::json!(3));
+        let found = detect_scan_services_filtered(ChannelType::GR, "27", &bytes, &[disallowed_old], None, None);
+        assert_eq!(found[0].serviceId, Some(101));
+        assert_eq!(found[0].name, "Old!");
+        assert_eq!(found[0].extra["serviceType"], serde_json::json!(1));
+
+        let old_without_primary = Channel {
+            name: "Configured without primary".into(),
+            channel_type: ChannelType::GR,
+            channel: "27".into(),
+            serviceId: None,
+            tunerChannels: None,
+            extra: HashMap::new(),
+        };
+        let found = detect_scan_services_filtered(ChannelType::GR, "27", &bytes, &[old_without_primary], None, None);
+        assert_eq!(found[0].serviceId, Some(101));
+        assert_eq!(found[0].name, "Old!");
+    }
+
+    #[test]
+    fn ts_scan_without_explicit_filter_preserves_allowed_old_primary_and_name() {
+        let pat = [0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 101, 0xe1, 0, 0, 0, 0, 0];
+        let nit = [0x40, 0xb0, 0x09, 0x12, 0x34, 0xc1, 0, 0, 0, 0, 0, 0, 0];
+        let sdt = [
+            0x42, 0xb0, 0x1b, 0, 1, 0xc1, 0, 0, 0, 1, 0xff, 0, 101, 0xfc, 0xf0, 0x0a,
+            0x48, 0x08, 1, 0, 5, b'N', b'H', b'K', b'!', b' ', 0, 0, 0, 0,
+        ];
+        fn packet(pid: u16, section: &[u8]) -> Vec<u8> {
+            let mut packet = vec![0xff; 188];
+            packet[..5].copy_from_slice(&[0x47, 0x40 | ((pid >> 8) as u8 & 0x1f), pid as u8, 0x10, 0]);
+            packet[5..5 + section.len()].copy_from_slice(section);
+            packet
+        }
+        let old = Channel {
+            name: "Configured NHK".into(),
+            channel_type: ChannelType::GR,
+            channel: "27".into(),
+            serviceId: Some(101),
+            tunerChannels: None,
+            extra: HashMap::from([(String::from("serviceType"), serde_json::json!(1))]),
+        };
+        let bytes = [packet(0, &pat), packet(0x10, &nit), packet(0x11, &sdt)].concat();
+        let found = detect_scan_services_filtered(ChannelType::GR, "27", &bytes, &[old], None, None);
+        assert_eq!(found[0].serviceId, Some(101));
+        assert_eq!(found[0].name, "Configured NHK");
     }
 
     #[test]
@@ -1605,6 +2640,8 @@ mod tests {
             vec![channel("13", 7, 101), channel("14", 7, 101)],
             &[ChannelType::GR],
             true,
+            None,
+            None,
         )
         .expect_err("colliding ServiceItemIds must not be persisted");
         assert!(error.contains("duplicate ServiceItemId"));
@@ -1614,6 +2651,8 @@ mod tests {
             vec![channel("13", 7, 65_536)],
             &[ChannelType::GR],
             true,
+            None,
+            None,
         )
         .expect_err("out-of-range ServiceItemId components must not be persisted");
         assert!(error.contains("between 0 and 65535"));

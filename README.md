@@ -18,7 +18,7 @@ Hotarun自身は録画、EPG収集、映像変換を行いません。
 - 1物理チャンネル内の複数サービス検出と`ServiceItemId`列挙
 - TS用`decoder`、BS4K用`tlvDecoder`のクライアント単位の外部プロセス
 - Mirakurun互換を目指した設定・一覧・状態・ストリームAPI
-- チャンネルスキャン（GR / BS / CS / BS4K、同期・非同期・進捗・中止・dryRun）
+- チャンネルスキャン（GR / BS / CS / SKY / BS4K、同期・非同期・進捗・中止・dryRun）
 - 設定保存APIと再起動要求API
 - 互換用CIDR設定、Origin / Referer検査、CORS
 - Unix socket、peer credential検証、socket mode `0660`
@@ -31,7 +31,7 @@ Hotarun自身は録画、EPG収集、映像変換を行いません。
 
 ## リリース
 
-バージョンは [SemVer](https://semver.org/) に準拠します。リリースタグは `vX.Y.Z` 形式です。現在のバージョンは `0.0.1` です。
+バージョンは [SemVer](https://semver.org/) に準拠します。リリースタグは `vX.Y.Z` 形式です。現在のバージョンは `0.0.2` です。
 
 Linux向けのリリースバイナリは、リリース番号によらない固定ファイル名で配布します。
 
@@ -58,7 +58,7 @@ chmod +x hotarun-linux-x86_64
 | `GR` | MPEG-2 TS | 対応 |
 | `BS` | MPEG-2 TS | 対応 |
 | `CS` | MPEG-2 TS | 対応 |
-| `SKY` | MPEG-2 TS | 配信のみ |
+| `SKY` | MPEG-2 TS | 対応（設定済み識別子を走査） |
 | `BS4K` | TLV/MMT | 対応 |
 
 ## アーキテクチャ
@@ -325,9 +325,9 @@ DELETE /api/config/channels/scan
 
 | query | 既定値 | 説明 |
 |---|---:|---|
-| `type` | 全種類 | `GR`、`BS`、`CS`、`BS4K` |
+| `type` | 全種類 | `GR`、`BS`、`CS`、`BS4K`。`channels.yml`にSKYが設定されている場合は`SKY`も含む |
 | `dryRun` | `false` | `channels.yml`へ保存しない |
-| `refresh` | `true` | 対象typeの未検出チャンネルを削除。`false`は既存を引き継ぐ |
+| `refresh` | `false` | 既存の対象チャンネルを再走査せず保持。`true`は対象を再走査して置換 |
 | `async` | `false` | `true`なら202を返してバックグラウンド実行 |
 | `serviceType` | なし | 検出サービス種別で絞り込む |
 
@@ -336,6 +336,7 @@ DELETE /api/config/channels/scan
 - DELETEは実行中スキャンを中止し、成功時は`206`を返します。
 - 1論理チャンネルのタイムアウトは20秒、全体のタイムアウトは30分です。
 - TSはPAT、actual NIT、actual SDTが揃うまで有効なサービスとして保存しません。
+- SKYはBS4Kとは異なりMPEG-2 TS経路で走査します。MirakurunにはSKY用の固定走査範囲がないため、`channels.yml`に設定済みのSKY識別子（例: `CH585`、`ATXHD`）を走査対象とし、推測した数値範囲は追加しません。Mirakurun互換のサービス種別（`0x01`、`0x02`、`0xA1`、`0xA4`、`0xA5`、`0xAD`、`0xC0`）だけを登録します。
 - BS4Kはactual TLV-NITとMMT PLT / SDTを検出し、fixtureでfragment、interleave、複数serviceを検証しています。
 - スキャンは既存の共有ストリームを利用でき、スキャンが所有していないチューナープロセスを停止しません。
 - 保存後の反映には再起動が必要です。
@@ -347,7 +348,7 @@ DELETE /api/config/channels/scan
 - Dashboard: server status、tuner status、active streams
 - Tuners: チューナー一覧と状態
 - Channels: チャンネル一覧
-- Scan: GR / BS / CS / BS4Kの非同期スキャン、進捗表示、中止
+- Scan: GR / BS / CS / SKY / BS4Kの非同期スキャン、進捗表示、中止
 - Configuration: `channels`、`tuners`、`server`の表示・保存
 
 UIはRustバイナリに埋め込んだ素のHTML/CSS/JavaScriptです。設定保存やスキャンはHTTP APIを呼び出します。
@@ -390,7 +391,7 @@ Hotarunには認証機能がありません。TCPリスナーは`0.0.0.0`で待�
 git diff --check
 ```
 
-- `cargo test --no-fail-fast`: **112 passed**
+- `cargo test --no-fail-fast`: **135 passed**
 - HTTP API、ストリーム共有、priority takeover、decoder、scan lifecycle、設定保存、任意TCP peer、Unix socket、Origin/Referer/CORS、Web UIを統合テストで検証
 - Rust製`hotarun-test-fixture`でTS/TLV、scan入力、decoder入出力を再現
 - BS4K MMT/TLV discoveryはfixture/testでactual TLV-NIT、MMT PLT/SDT、fragment/interleave、複数serviceを検証
@@ -420,9 +421,9 @@ BS4K MMT/TLV discovery自体はfixture/testで実装・検証済みですが、�
 - EPG収集、番組データベース、録画管理
 - HLS / DASH、DLNA、トランスコード、メディアサーバー機能
 - 設定ファイルのホットリロード
-- `SKY`のチャンネルスキャン（配信設定とTS配信は対応）
+- SKYの固定数値範囲スキャン（Mirakurun本家にも固定範囲がないため、設定済み識別子の走査を使用）
 
-また、環境に`rustfmt`が導入されていないため、今回の検証ではrustfmtを実行していません。
+`cargo fmt -- --check`は実行しましたが、既存および今回の変更を含む多数の整形差分が検出されました。無関係な広範囲の自動整形を避けるため、リリース前には自動整形を適用していません。
 
 ## ライセンス
 

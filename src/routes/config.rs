@@ -44,6 +44,7 @@ async fn save_channels(State(state): State<Arc<AppState>>, Json(payload): Json<C
         };
         return Err(ApiError::with_errors(400, reason, errors));
     }
+    let _lock = state.channel_config_lock.lock().await;
     save_config(&state, "channels.yml", &items).await
 }
 

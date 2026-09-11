@@ -70,7 +70,17 @@ fn parse_channel_type(value: &str) -> Option<ChannelType> {
 fn find_channel(channels: &[Channel], channel_type: ChannelType, channel: &str) -> Option<Channel> {
     channels
         .iter()
-        .find(|item| item.channel_type == channel_type && item.channel == channel)
+        .find(|item| {
+            item.channel_type == channel_type
+                && (item.channel == channel
+                    || item.serviceId.is_some_and(|service_id| {
+                        item.channel
+                            .rsplit_once(':')
+                            .is_some_and(|(logical, suffix)| {
+                                logical == channel && suffix.parse::<i64>().ok() == Some(service_id)
+                            })
+                    }))
+        })
         .cloned()
 }
 

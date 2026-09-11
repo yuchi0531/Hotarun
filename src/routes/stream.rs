@@ -54,7 +54,17 @@ fn parse_channel_type(s: &str) -> Option<ChannelType> {
 fn find_channel(channels: &[Channel], ct: ChannelType, name: &str) -> Option<Channel> {
     channels
         .iter()
-        .find(|c| c.channel_type == ct && c.channel == name)
+        .find(|c| {
+            c.channel_type == ct
+                && (c.channel == name
+                    || c.serviceId.is_some_and(|service_id| {
+                        c.channel
+                            .rsplit_once(':')
+                            .is_some_and(|(logical, suffix)| {
+                                logical == name && suffix.parse::<i64>().ok() == Some(service_id)
+                            })
+                    }))
+        })
         .cloned()
 }
 
@@ -116,7 +126,7 @@ async fn acquire_tuner(
             if !state.manager.is_sharing_candidate(idx, &phys).await {
                 continue;
             }
-            match state.manager.acquire_with_priority(idx, &phys, priority).await {
+            match state.manager.acquire_http_with_priority(idx, &phys, priority).await {
                 Ok((_pid, generation)) => {
                     match state
                         .manager

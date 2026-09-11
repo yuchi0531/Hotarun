@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{body::Body, extract::{Query, State}, http::{header, StatusCode}, response::{IntoResponse, Response}, Json, Router, routing::put};
 use serde::Deserialize;
 
-use crate::{config::{AppState, ChannelType}, error::ApiError, scan::ChannelScanStatus};
+use crate::{config::{AppState, ChannelType}, error::ApiError, scan::{ChannelScanStatus, ScanMode}};
 
 #[derive(Debug, Deserialize)]
 pub struct ScanQuery {
@@ -11,26 +11,35 @@ pub struct ScanQuery {
     pub channel_type: Option<String>,
     #[serde(default, alias = "dryRun")]
     pub dry_run: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub refresh: bool,
     #[serde(default, alias = "async")]
     pub async_: bool,
     #[serde(default, rename = "serviceType", alias = "service_type")]
     pub service_type: Option<i64>,
+    #[serde(default, rename = "scanMode", alias = "scan_mode")]
+    pub scan_mode: Option<String>,
 }
-
-fn default_true() -> bool { true }
 
 fn parse_type(value: Option<&str>) -> Result<Option<ChannelType>, ApiError> {
     value.map(|value| match value.to_ascii_uppercase().as_str() {
-        "GR" => Ok(ChannelType::GR), "BS" => Ok(ChannelType::BS), "CS" => Ok(ChannelType::CS), "BS4K" => Ok(ChannelType::BS4K),
+        "GR" => Ok(ChannelType::GR), "BS" => Ok(ChannelType::BS), "CS" => Ok(ChannelType::CS), "SKY" => Ok(ChannelType::SKY), "BS4K" => Ok(ChannelType::BS4K),
         _ => Err(ApiError::bad_request(format!("invalid scan type: {value}"))),
+    }).transpose()
+}
+
+fn parse_scan_mode(value: Option<&str>) -> Result<Option<ScanMode>, ApiError> {
+    value.map(|value| match value.to_ascii_lowercase().as_str() {
+        "channel" => Ok(ScanMode::Channel),
+        "service" => Ok(ScanMode::Service),
+        _ => Err(ApiError::bad_request(format!("invalid scanMode: {value}"))),
     }).transpose()
 }
 
 async fn start_scan(State(state): State<Arc<AppState>>, Query(query): Query<ScanQuery>) -> Result<Response, ApiError> {
     let kind = parse_type(query.channel_type.as_deref())?;
-    let accepted = state.scan.begin(Arc::clone(&state), kind, query.dry_run, query.refresh, query.async_, query.service_type)
+    let scan_mode = parse_scan_mode(query.scan_mode.as_deref())?;
+    let accepted = state.scan.begin(Arc::clone(&state), kind, query.dry_run, query.refresh, query.async_, query.service_type, scan_mode)
         .await.map_err(|error| {
             if error.contains("already") {
                 ApiError::new(409, error)
@@ -43,6 +52,7 @@ async fn start_scan(State(state): State<Arc<AppState>>, Query(query): Query<Scan
                 || error.contains("no valid TS")
                 || error.contains("no data")
                 || error.contains("channel scan timeout")
+                || error.contains("scan timed out")
             {
                 ApiError::new(503, error)
             } else {
@@ -56,10 +66,11 @@ async fn start_scan(State(state): State<Arc<AppState>>, Query(query): Query<Scan
     }
     let result = state.scan.status().await;
     if result.status == "error" {
+        let error = result.error.clone().unwrap_or_else(|| "scan failed".to_owned());
         return Err(ApiError::with_errors(
-            500,
-            result.error.clone().unwrap_or_else(|| "scan failed".to_owned()),
-            result.error.into_iter().collect(),
+            if error.contains("timed out") || error.contains("timeout") { 503 } else { 500 },
+            error.clone(),
+            vec![error],
         ));
     }
     let body = serde_yaml::to_string(&result.channels)

@@ -131,6 +131,13 @@ pub struct TunerSlot {
     /// fan-out先 (§10)。各要素が1クライアントへのboundedキュー。
     /// pumpが `try_send` でノンブロッキング配信し、遅延者がいても切断しない。
     senders: Vec<mpsc::Sender<Vec<u8>>>,
+    /// Scan subscriptions are closed when the current tuner process reaches
+    /// EOF.  HTTP subscriptions remain open so the watcher can respawn the
+    /// process and continue an existing stream.
+    scan_senders: Vec<mpsc::Sender<Vec<u8>>>,
+    /// A process is shareable only after stdout has been handed to its pump.
+    /// This keeps HTTP acquisition out of the start/setup window.
+    pump_ready: bool,
     /// stdout pump token.  Unlike `process_generation`, this changes for a
     /// respawn too: a logical lease can survive a respawn, but bytes buffered
     /// by the old OS process must not survive it.
@@ -169,6 +176,8 @@ impl TunerSlot {
             start_generation: 0,
             process: None,
             senders: Vec::new(),
+            scan_senders: Vec::new(),
+            pump_ready: false,
             pump_token: 0,
             request_priorities: Vec::new(),
             respawn_pending: false,
@@ -365,6 +374,21 @@ impl TunerManager {
                 return Ok(v.clone());
             }
         }
+        // Legacy compatibility only: an explicit tuner mapping always wins.
+        if let Some(physical) = channel.extra.get("physicalChannel").and_then(|value| value.as_str()) {
+            return Ok(physical.to_owned());
+        }
+        // Mirakurun service-mode entries identify a service as
+        // `<logical-channel>:<serviceId>`.  The service suffix is not a tuner
+        // command channel; use the logical prefix when no explicit mapping is
+        // configured.
+        if let Some(service_id) = channel.serviceId {
+            if let Some((logical, suffix)) = channel.channel.rsplit_once(':') {
+                if suffix.parse::<i64>().ok() == Some(service_id) {
+                    return Ok(logical.to_owned());
+                }
+            }
+        }
         Ok(channel.channel.clone())
     }
 
@@ -482,6 +506,8 @@ impl TunerManager {
                         s.current_channel = None;
                         s.wanted_channel = None;
                         s.senders.clear();
+                        s.scan_senders.clear();
+                        s.pump_ready = false;
                         s.state = TunerState::Idle;
                     }
                     return Err(TunerError::Busy(format!(
@@ -587,6 +613,8 @@ impl TunerManager {
                     // 新規起動では前回の残骸チャネルを捨て、次に来る
                     // `create_subscription` から作り直す。
                     s.senders.clear();
+                    s.scan_senders.clear();
+                    s.pump_ready = false;
                 }
                 tracing::info!(index, pid, channel = %physical_channel, "tuner streaming");
                 Ok((pid, s.process_generation))
@@ -601,6 +629,8 @@ impl TunerManager {
                             s.process = None;
                             s.pid = None;
                             s.senders.clear();
+                            s.scan_senders.clear();
+                            s.pump_ready = false;
                             s.record_failure()
                         }
                         Err(_) => TunerState::Error,
@@ -675,12 +705,18 @@ impl TunerManager {
         physical_channel: &str,
         priority: i32,
     ) -> Result<(u32, u64), TunerError> {
-        {
+        loop {
             let mut s = self
                 .slot_mutex(index)
                 .map_err(TunerError::NotFound)?
                 .lock()
                 .await;
+            if s.state == TunerState::Stopping {
+                let notified = Arc::clone(&s.idle_notify).notified_owned();
+                drop(s);
+                notified.await;
+                continue;
+            }
             if s.state == TunerState::Streaming
                 && s.current_channel.as_deref() == Some(physical_channel)
                 && s.process.is_some()
@@ -691,9 +727,42 @@ impl TunerManager {
                 s.wanted_channel = Some(physical_channel.to_owned());
                 return Ok((s.pid.unwrap_or(0), s.process_generation));
             }
+            break;
         }
         self.start_with_priority(index, physical_channel, priority)
             .await
+    }
+
+    /// HTTP streams may share only after stdout is attached to the fan-out
+    /// pump.  A scan can otherwise expose a Streaming process during setup
+    /// with no reader for the HTTP subscriber to consume.
+    pub async fn acquire_http_with_priority(
+        &self,
+        index: usize,
+        physical_channel: &str,
+        priority: i32,
+    ) -> Result<(u32, u64), TunerError> {
+        let mut s = self
+            .slot_mutex(index)
+            .map_err(TunerError::NotFound)?
+            .lock()
+            .await;
+        if s.state == TunerState::Streaming
+            && s.current_channel.as_deref() == Some(physical_channel)
+            && s.process.is_some()
+            && s.pump_ready
+        {
+            s.cancel_idle_stop();
+            s.use_count = s.use_count.saturating_add(1);
+            s.request_priorities.push(priority);
+            s.wanted_channel = Some(physical_channel.to_owned());
+            return Ok((s.pid.unwrap_or(0), s.process_generation));
+        }
+        if s.state != TunerState::Idle && s.state != TunerState::Error {
+            return Err(TunerError::Busy(format!("tuner {index} is busy")));
+        }
+        drop(s);
+        self.start_with_priority(index, physical_channel, priority).await
     }
 
     /// Atomically evict a lower-priority stream and start the requested
@@ -730,6 +799,8 @@ impl TunerManager {
             s.pid = None;
             s.pump_token = NEXT_PUMP_TOKEN.fetch_add(1, Ordering::Relaxed);
             s.senders.clear();
+            s.scan_senders.clear();
+            s.pump_ready = false;
             s.process.take()
         };
 
@@ -775,6 +846,8 @@ impl TunerManager {
                     s.use_count = 0;
                     s.request_priorities.clear();
                     s.senders.clear();
+                    s.scan_senders.clear();
+                    s.pump_ready = false;
                     return Ok(());
                 }
                 Some(p) => {
@@ -782,6 +855,8 @@ impl TunerManager {
                     // 購読者は停止開始時点でEOFにする。プロセスの終了待ち
                     // (最大6秒) の間もHTTP serverがdrainできるようにする。
                     s.senders.clear();
+                    s.scan_senders.clear();
+                    s.pump_ready = false;
                     s.use_count = 0;
                     s.request_priorities.clear();
                     p
@@ -800,6 +875,8 @@ impl TunerManager {
         s.use_count = 0;
         s.request_priorities.clear();
         s.senders.clear();
+        s.scan_senders.clear();
+        s.pump_ready = false;
         if !s.state.is_terminal() {
             s.state = TunerState::Idle;
         }
@@ -937,6 +1014,61 @@ impl TunerManager {
         Ok(())
     }
 
+    /// Release a scan lease and synchronously reclaim its process when it was
+    /// the final lease.  Normal HTTP releases deliberately use the three
+    /// second idle grace, but a scanner must not advance to the next channel
+    /// while its old process is still occupying the only tuner slot.
+    ///
+    /// The process is taken while the use-count transition is protected by the
+    /// slot lock.  An HTTP acquire that wins after the transition therefore
+    /// either keeps the process alive (use_count > 0) or starts only after the
+    /// synchronous stop has made the slot idle.
+    pub async fn release_lease_immediately(
+        &self,
+        index: usize,
+        generation: u64,
+        priority: Option<i32>,
+    ) -> Result<(), String> {
+        let process = {
+            let mut s = self.slot_mutex(index)?.lock().await;
+            if s.process_generation != generation {
+                return Ok(());
+            }
+            s.use_count = s.use_count.saturating_sub(1);
+            s.remove_request_priority(priority);
+            if s.use_count > 0 {
+                return Ok(());
+            }
+
+            s.cancel_idle_stop();
+            s.wanted_channel = None;
+            s.respawn_pending = false;
+            if matches!(s.state, TunerState::Starting | TunerState::Tuning) {
+                s.start_generation = s.start_generation.wrapping_add(1);
+                s.state = TunerState::Idle;
+            }
+
+            let Some(process) = s.process.take() else {
+                s.current_channel = None;
+                s.pid = None;
+                if !s.state.is_terminal() {
+                    s.state = TunerState::Idle;
+                }
+                s.idle_notify.notify_waiters();
+                return Ok(());
+            };
+
+            s.state = TunerState::Stopping;
+            s.pump_token = NEXT_PUMP_TOKEN.fetch_add(1, Ordering::Relaxed);
+            s.senders.clear();
+            s.scan_senders.clear();
+            s.pump_ready = false;
+            process
+        };
+
+        self.finish_stopped_process(index, process).await
+    }
+
     /// stdout を pump (fan-out) へ引き渡す。呼び出し後は pump が所有する。
     pub async fn take_stdout(
         &self,
@@ -996,6 +1128,30 @@ impl TunerManager {
         Ok(rx)
     }
 
+    /// Attach a scan subscriber.  Unlike an HTTP subscriber, this receiver is
+    /// closed when the current process reaches EOF so a finite scan fixture or
+    /// a failed tuner does not wait for the channel timeout.
+    pub async fn create_scan_subscription_for_generation(
+        &self,
+        index: usize,
+        expected_generation: u64,
+    ) -> Result<mpsc::Receiver<Vec<u8>>, String> {
+        let mut s = self.slot_mutex(index)?.lock().await;
+        if s.state.is_terminal() {
+            return Err(format!("tuner {index} is terminal"));
+        }
+        if s.state != TunerState::Streaming
+            || s.process.is_none()
+            || s.process_generation != expected_generation
+        {
+            return Err(format!("tuner {index} is not streaming"));
+        }
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_LEN);
+        s.scan_senders.push(tx);
+        s.scan_senders.retain(|tx| !tx.is_closed());
+        Ok(rx)
+    }
+
     /// pumpを起動する。tuner stdoutを読み、購読者全員へ `try_send` する。
     /// Full は当該subscriberを切断せず、そのチャンクだけを落とす。
     /// 遅延clientを維持しつつ、overflowはカウンタとログで観測可能にする。
@@ -1020,6 +1176,7 @@ impl TunerManager {
                     return;
                 }
                 slot.pump_token = token;
+                slot.pump_ready = true;
             }
             let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
             loop {
@@ -1033,6 +1190,13 @@ impl TunerManager {
                 let chunk = buf[..n].to_vec();
                 if !mgr.fanout_chunk(index, token, chunk).await {
                     continue;
+                }
+            }
+            if let Some(slot) = mgr.slots.get(index) {
+                let mut slot = slot.lock().await;
+                if slot.pump_token == token {
+                    slot.scan_senders.clear();
+                    slot.pump_ready = false;
                 }
             }
         })
@@ -1051,6 +1215,15 @@ impl TunerManager {
                 overflowed = true;
                 STREAM_FANOUT_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(index, "tuner fan-out subscriber queue overflow; chunk dropped");
+                true
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
+        slot.scan_senders.retain(|tx| match tx.try_send(chunk.clone()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                STREAM_FANOUT_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(index, "tuner scan fan-out subscriber queue overflow; chunk dropped");
                 true
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
@@ -1236,7 +1409,8 @@ impl TunerManager {
                 // stop() 等で既に片付いていれば何もしない。
                 if s.process.is_none() && s.use_count == 0 {
                     s.record_success();
-                    s.senders.clear();
+            s.senders.clear();
+            s.scan_senders.clear();
                     s.current_channel = None;
                     s.wanted_channel = None;
                     if !s.state.is_terminal() {
@@ -1514,6 +1688,29 @@ mod tests {
             extra: HashMap::new(),
         };
         assert_eq!(m.physical_channel_for(0, &ch).await.unwrap(), "13");
+    }
+
+    #[tokio::test]
+    async fn service_channel_uses_logical_target_and_mapping_wins_legacy_extension() {
+        let m = TunerManager::new(vec![tuner_with_command(
+            "DVB-C-0",
+            Some("recdvb <channel>"),
+        )]);
+        let ch = Channel {
+            name: "service".to_owned(),
+            channel_type: ChannelType::SKY,
+            channel: "CH585:101".to_owned(),
+            serviceId: Some(101),
+            tunerChannels: Some(HashMap::from([("DVB-C-0".to_owned(), "13".to_owned())])),
+            extra: HashMap::from([(String::from("physicalChannel"), serde_json::json!("999"))]),
+        };
+        assert_eq!(m.physical_channel_for(0, &ch).await.unwrap(), "13");
+
+        let mut without_mapping = ch;
+        without_mapping.tunerChannels = None;
+        assert_eq!(m.physical_channel_for(0, &without_mapping).await.unwrap(), "999");
+        without_mapping.extra.clear();
+        assert_eq!(m.physical_channel_for(0, &without_mapping).await.unwrap(), "CH585");
     }
 
     #[tokio::test]

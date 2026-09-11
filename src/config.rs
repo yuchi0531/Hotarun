@@ -332,6 +332,8 @@ pub struct AppState {
     pub restart: Arc<Notify>,
     pub restart_requested: Arc<AtomicBool>,
     pub scan: Arc<crate::scan::ScanManager>,
+    /// Serializes channel configuration writes with scan commits.
+    pub channel_config_lock: Arc<Mutex<()>>,
     pub logs: Arc<Mutex<VecDeque<LogEntry>>>,
 }
 
@@ -358,6 +360,7 @@ impl Default for AppState {
             restart: Arc::new(Notify::new()),
             restart_requested: Arc::new(AtomicBool::new(false)),
             scan: crate::scan::ScanManager::new(),
+            channel_config_lock: Arc::new(Mutex::new(())),
             logs: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -383,6 +386,7 @@ impl AppState {
             restart: Arc::new(Notify::new()),
             restart_requested: Arc::new(AtomicBool::new(false)),
             scan: crate::scan::ScanManager::new(),
+            channel_config_lock: Arc::new(Mutex::new(())),
             logs: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -402,8 +406,18 @@ impl AppState {
             restart: Arc::new(Notify::new()),
             restart_requested: Arc::new(AtomicBool::new(false)),
             scan: crate::scan::ScanManager::new(),
+            channel_config_lock: Arc::new(Mutex::new(())),
             logs: Arc::new(Mutex::new(VecDeque::new())),
         }
+    }
+
+    /// Read the current channels file after taking the channel configuration
+    /// lock.  AppState remains a startup snapshot by design.
+    pub fn reload_channels(&self) -> Vec<Channel> {
+        let Some(directory) = self.config_dir.as_deref() else {
+            return self.channels.clone();
+        };
+        load_channels_config(&directory.join("channels.yml"))
     }
 
     pub async fn record_log(&self, level: i8, message: impl Into<String>) {
@@ -479,6 +493,16 @@ pub fn write_yaml_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Str
     ));
     std::fs::write(&temporary, text).map_err(|error| format!("write temporary config: {error}"))?;
     std::fs::rename(&temporary, path).map_err(|error| format!("replace config: {error}"))
+}
+
+/// Load and sanitize the current channels file. The caller serializes this
+/// read with channel configuration writes.
+pub fn load_channels_config(path: &Path) -> Vec<Channel> {
+    let mut channels = load_list::<Channel>(path, "channels");
+    reject_duplicate_channel_pairs(&mut channels);
+    reject_invalid_service_item_ids(&mut channels);
+    reject_duplicate_service_ids(&mut channels);
+    channels
 }
 
 fn reject_duplicate_service_ids(channels: &mut Vec<Channel>) {
