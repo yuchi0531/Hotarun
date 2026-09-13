@@ -1,5 +1,7 @@
 # Hotarun
 
+##mirakcをフォークした方がどう考えてもいいと気づいたのでやめる
+
 Rust/Axumで実装した、Mirakurun/MMirakurun互換の軽量チューナーサーバーです。
 チューナープログラムの標準出力を受け取り、HTTPストリームとして配信します。
 Hotarun自身は録画、EPG収集、映像変換を行いません。
