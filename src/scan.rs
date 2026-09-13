@@ -30,13 +30,25 @@ fn default_scan_mode(kind: ChannelType) -> ScanMode {
     }
 }
 
+fn effective_scan_mode(kind: ChannelType, requested: Option<ScanMode>) -> ScanMode {
+    requested.unwrap_or_else(|| default_scan_mode(kind))
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[allow(non_snake_case)]
 pub struct ChannelScanStatus {
     pub status: String,
+    pub isScanning: bool,
     #[serde(rename = "type")]
     pub type_: Option<ChannelType>,
     pub progress: u8,
+    pub currentChannel: String,
+    pub scanLog: Vec<String>,
+    pub newCount: usize,
+    pub takeoverCount: usize,
+    pub result: Vec<Channel>,
+    pub startTime: Option<u64>,
+    pub updateTime: Option<u64>,
     pub scanned: usize,
     pub total: usize,
     pub channels: Vec<Channel>,
@@ -48,8 +60,12 @@ pub struct ChannelScanStatus {
 
 impl Default for ChannelScanStatus {
     fn default() -> Self {
-        Self { status: "idle".to_owned(), type_: None, progress: 0, scanned: 0, total: 0,
-            channels: Vec::new(), error: None, dryRun: false, refresh: false, startedAt: None }
+        Self {
+            status: "not_started".to_owned(), isScanning: false, type_: None, progress: 0,
+            currentChannel: String::new(), scanLog: Vec::new(), newCount: 0, takeoverCount: 0,
+            result: Vec::new(), scanned: 0, total: 0, channels: Vec::new(), error: None,
+            startTime: None, updateTime: None, dryRun: false, refresh: false, startedAt: None,
+        }
     }
 }
 
@@ -193,9 +209,20 @@ impl ScanManager {
             self.cancelled.store(false, Ordering::Release);
             current.scan_generation = ScanGeneration(current.scan_generation.0.wrapping_add(1));
             current.task_running = true;
-            current.status = ChannelScanStatus { status: "running".to_owned(), type_: kind, progress: 0,
-                scanned: 0, total, channels: Vec::new(), error: None, dryRun: dry_run, refresh,
-                startedAt: Some(epoch_seconds()) };
+            current.status = ChannelScanStatus {
+                status: "scanning".to_owned(), isScanning: true, type_: kind, progress: 0,
+                currentChannel: String::new(), scanLog: Vec::new(), newCount: 0,
+                takeoverCount: 0, result: Vec::new(), scanned: 0, total, channels: Vec::new(),
+                startTime: Some(epoch_millis()), updateTime: Some(epoch_millis()),
+                error: None, dryRun: dry_run, refresh, startedAt: Some(epoch_seconds()),
+            };
+            current.status.scanLog.push(format!(
+                "channel scanning... (type: {:?})",
+                kind.unwrap_or(ChannelType::GR)
+            ));
+            if dry_run {
+                current.status.scanLog.push("-- dry run --".to_owned());
+            }
             current.scan_generation
         };
         let manager = Arc::clone(self);
@@ -208,21 +235,32 @@ impl ScanManager {
             let mut current = manager.state.lock().await;
             if current.scan_generation == scan_generation && current.task_running {
                 current.task_running = false;
+                current.status.isScanning = false;
+                current.status.updateTime = Some(epoch_millis());
                 let cancelled = !timed_out && (current.status.status == "cancelled"
                     || manager.cancelled.load(Ordering::Acquire));
                 if timed_out {
                     current.status.status = "error".to_owned();
                     current.status.error = Some("scan timed out".to_owned());
+                    current.status.scanLog.push("channel scan timed out".to_owned());
                 } else if !cancelled {
                     match &result {
                         Ok(channels) => {
-                            current.status.status = "complete".to_owned();
+                            current.status.status = "completed".to_owned();
                             current.status.progress = 100;
+                            current.status.result = channels.clone();
                             current.status.channels = channels.clone();
+                            let new_count = current.status.newCount;
+                            let takeover_count = current.status.takeoverCount;
+                            current.status.scanLog.push(format!(
+                                "channel scan completed: {} result(s), {} new, {} takeover",
+                                channels.len(), new_count, takeover_count
+                            ));
                         }
                         Err(error) => {
                             current.status.status = "error".to_owned();
                             current.status.error = Some(error.clone());
+                            current.status.scanLog.push(format!("channel scan failed: {error}"));
                             let state = state.clone();
                             let error = error.clone();
                             tokio::spawn(async move {
@@ -250,10 +288,16 @@ impl ScanManager {
     pub async fn cancel(&self) -> Result<bool, String> {
         let mut state = self.state.lock().await;
         if !state.task_running { return Ok(false); }
+        if state.status.status == "cancelled" {
+            return Err("scan cancellation is already requested".to_owned());
+        }
         self.cancelled.store(true, Ordering::Release);
         self.cancel_notify.notify_waiters();
         let _ = self.cancel_watch.send(state.scan_generation);
         state.status.status = "cancelled".to_owned();
+        state.status.isScanning = true;
+        state.status.updateTime = Some(epoch_millis());
+        state.status.scanLog.push("scan cancellation requested".to_owned());
         Ok(true)
     }
 
@@ -261,7 +305,7 @@ impl ScanManager {
         let state = self.state.lock().await;
         state.scan_generation == scan_generation
             && state.task_running
-            && state.status.status == "running"
+            && matches!(state.status.status.as_str(), "scanning" | "running")
             && !self.cancelled.load(Ordering::Acquire)
     }
 
@@ -276,7 +320,9 @@ impl ScanManager {
 
     pub async fn is_running(&self) -> bool {
         let state = self.state.lock().await;
-        state.task_running && state.status.status == "running" && !self.cancelled.load(Ordering::Acquire)
+        state.task_running
+            && matches!(state.status.status.as_str(), "scanning" | "running")
+            && !self.cancelled.load(Ordering::Acquire)
     }
 
     async fn commit(
@@ -314,7 +360,7 @@ impl ScanManager {
         let mut state = self.state.lock().await;
         if state.scan_generation != scan_generation
             || !state.task_running
-            || state.status.status != "running"
+            || !matches!(state.status.status.as_str(), "scanning" | "running")
             || self.cancelled.load(Ordering::Acquire)
         {
             return Err("scan cancelled".to_owned());
@@ -332,9 +378,18 @@ impl ScanManager {
         // false instead of changing a successfully written configuration to
         // "cancelled" in the completion epilogue.
         state.task_running = false;
-        state.status.status = "complete".to_owned();
+        state.status.status = "completed".to_owned();
+        state.status.isScanning = false;
+        state.status.result = merged.clone();
+        state.status.updateTime = Some(epoch_millis());
         state.status.progress = 100;
         state.status.channels = merged.clone();
+        let new_count = state.status.newCount;
+        let takeover_count = state.status.takeoverCount;
+        state.status.scanLog.push(format!(
+            "channel scan completed: {} result(s), {} new, {} takeover",
+            merged.len(), new_count, takeover_count
+        ));
         Ok(merged)
     }
 }
@@ -350,10 +405,59 @@ pub fn scan_channels(kind: ChannelType) -> Vec<String> {
             targets.dedup();
             targets
         }
-        ChannelType::CS => (2..=24).map(|n| format!("CS{n}")).collect(),
+        // CSは110度CSの物理トランスポンダND2/ND4/.../ND24に対応する。
+        // recpt1的なCS2-CS24連番ではなく、BonDriver/TVTest的な偶数のみが正規。
+        // Mirakurun互換のAPI表示もNDxxを用いる。
+        ChannelType::CS => (2..=24).step_by(2).map(|n| format!("ND{n}")).collect(),
         ChannelType::BS4K => vec!["BS4K45328".to_owned()],
         ChannelType::SKY => Vec::new(),
     }
+}
+
+/// CSの論理チャンネル正規化。旧来の `CS<n>` を正規の `ND<n>` に読み替える。
+/// `ND<n>` はそのまま返す。CS以外の種別や該当しない文字列は無変換。
+/// API lookupやスキャンの突合で旧設定との互換性維持に使う。
+pub(crate) fn canonical_cs_logical(kind: ChannelType, logical: &str) -> String {
+    if kind != ChannelType::CS {
+        return logical.to_owned();
+    }
+    // `channel: "ND2:101"` のようなservice-mode由来の論理部は既に `:` 分離済み
+    // の前提だが、念のため `:` 以降があれば前半だけ見る呼び出し側で処理する。
+    // ここでは純粋な論理チャンネル文字列のprefixのみ正規化する。
+    if logical.len() > 2 {
+        let (prefix, rest) = logical.split_at(2);
+        if prefix.eq_ignore_ascii_case("CS") && !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            return format!("ND{rest}");
+        }
+        if prefix.eq_ignore_ascii_case("ND") && !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            // `nd2` のような小文字入力を `ND2` に寄せる。数字部は保持する。
+            return format!("ND{rest}");
+        }
+    }
+    logical.to_owned()
+}
+
+/// 設定レコードの正規論理チャンネル。`logical_channel` にCS正規化を適用する。
+/// 表示・突合はこの正規形で行い、保存時の `channel` フィールド自体は触らない。
+pub(crate) fn canonical_logical_channel(channel: &Channel) -> String {
+    canonical_cs_logical(channel.channel_type, &logical_channel(channel))
+}
+
+/// `channel` フィールド全体の正規化。service-modeの `ND2:101` 形式も
+/// 論理部だけCS→NDに寄せる。APIの新旧表記ゆれ吸収に使う。
+fn canonical_channel_field(kind: ChannelType, field: &str) -> String {
+    if kind != ChannelType::CS {
+        return field.to_owned();
+    }
+    if let Some((logical, suffix)) = field.rsplit_once(':') {
+        // `suffix` がserviceIdらしい場合のみ論理部を正規化する。
+        // それ以外のコロン付き識別子はそのままにする。
+        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            return format!("{}:{suffix}", canonical_cs_logical(kind, logical));
+        }
+        return field.to_owned();
+    }
+    canonical_cs_logical(kind, field)
 }
 
 /// Return the Mirakurun scan targets for a type.  SKY deliberately has no
@@ -391,7 +495,7 @@ pub fn scan_targets(kind: ChannelType, configured: &[Channel]) -> Vec<String> {
 /// Resolve the logical/physical target represented by a configured channel.
 /// Older configurations may contain `logical:serviceId` entries; scans now
 /// write the logical channel and keep additional services in `extra.services`.
-fn logical_channel(channel: &Channel) -> String {
+pub(crate) fn logical_channel(channel: &Channel) -> String {
     if let Some(physical) = channel.extra.get("physicalChannel").and_then(|value| value.as_str()) {
         return physical.to_owned();
     }
@@ -406,7 +510,23 @@ fn logical_channel(channel: &Channel) -> String {
 }
 
 fn configured_channel_for<'a>(channels: &'a [Channel], kind: ChannelType, logical: &str) -> Option<&'a Channel> {
-    channels.iter().find(|channel| channel.channel_type == kind && logical_channel(channel) == logical)
+    let want = canonical_cs_logical(kind, logical);
+    channels.iter().find(|channel| {
+        channel.channel_type == kind && canonical_logical_channel(channel) == want
+    })
+}
+
+fn is_disabled(channel: &Channel) -> bool {
+    channel.extra.get("isDisabled").and_then(|value| value.as_bool()).unwrap_or(false)
+}
+
+fn has_enabled_configured_channel(channels: &[Channel], kind: ChannelType, logical: &str) -> bool {
+    let want = canonical_cs_logical(kind, logical);
+    channels.iter().any(|channel| {
+        channel.channel_type == kind
+            && canonical_logical_channel(channel) == want
+            && !is_disabled(channel)
+    })
 }
 
 fn default_scan_types(configured: &[Channel]) -> Vec<ChannelType> {
@@ -442,7 +562,7 @@ async fn run_scan(
     let needs_tuner = refresh || types.iter().any(|kind| {
         target_sets
             .get(kind)
-            .is_none_or(|targets| targets.iter().any(|logical| configured_channel_for(&state.channels, *kind, logical).is_none()))
+            .is_none_or(|targets| targets.iter().any(|logical| !has_enabled_configured_channel(&state.channels, *kind, logical)))
     });
     if state.config_dir.is_some()
         && needs_tuner
@@ -459,14 +579,23 @@ async fn run_scan(
     for kind in types {
         for logical in scan_targets(*kind, &state.channels) {
             if !scans.is_running_generation(scan_generation).await { return Err("scan cancelled".to_owned()); }
-            if !refresh && configured_channel_for(&state.channels, *kind, &logical).is_some() {
+            if !refresh && has_enabled_configured_channel(&state.channels, *kind, &logical) {
                 // Mirakurun's default is not to rescan an already configured
                 // target. The target remains selected for merge, while stale
                 // records outside this request's target set are removed.
                 retained_types.insert(*kind);
                 let mut current = scans.state.lock().await;
                 current.status.scanned += 1;
+                current.status.currentChannel = logical.to_owned();
+                current.status.updateTime = Some(epoch_millis());
                 current.status.progress = ((current.status.scanned * 100) / current.status.total.max(1)).min(99) as u8;
+                let retained = state.channels.iter()
+                    .filter(|channel| channel.channel_type == *kind && canonical_logical_channel(channel) == canonical_cs_logical(*kind, &logical) && !is_disabled(channel))
+                    .count();
+                current.status.takeoverCount += retained;
+                current.status.scanLog.push(format!(
+                    "channel {logical}: retained {retained} existing config(s) (refresh=false)"
+                ));
                 continue;
             }
             // CHANNEL_TIMEOUT is a budget for the complete logical channel,
@@ -495,16 +624,35 @@ async fn run_scan(
                     last_error = Some(error.clone());
                     tracing::warn!(?kind, %logical, %error, "scan channel failed");
                     state.record_log(1, format!("scan channel {kind:?}/{logical} failed: {error}")).await;
+                    let mut current = scans.state.lock().await;
+                    current.status.scanLog.push(format!("channel {logical}: scan failed: {error}"));
+                    current.status.updateTime = Some(epoch_millis());
                     Vec::new()
                 }
             };
             let detected = detect_scan_services_filtered(*kind, &logical, &bytes, &state.channels, service_type, scan_mode);
+            let detected_count = detected.len();
             if !detected.is_empty() {
                 found_types.insert(*kind);
             }
             found.extend(detected);
             let mut current = scans.state.lock().await;
+            let existing = has_enabled_configured_channel(&state.channels, *kind, &logical);
+            if existing {
+                current.status.takeoverCount += detected_count;
+            } else {
+                current.status.newCount += detected_count;
+            }
+            if detected_count > 0 {
+                current.status.scanLog.push(format!(
+                    "channel {logical}: detected {detected_count} service result(s)"
+                ));
+            } else {
+                current.status.scanLog.push(format!("channel {logical}: no services detected"));
+            }
             current.status.scanned += 1;
+            current.status.currentChannel = logical.to_owned();
+            current.status.updateTime = Some(epoch_millis());
             current.status.progress = ((current.status.scanned * 100) / current.status.total.max(1)).min(99) as u8;
         }
     }
@@ -976,7 +1124,7 @@ fn detect_ts_services(
     old: &[Channel],
     allowed_service_types: Option<&[i64]>,
     service_type: Option<i64>,
-    _scan_mode: ScanMode,
+    scan_mode: ScanMode,
 ) -> Vec<Channel> {
     let sections = assemble_psi(bytes);
     let mut programs = pat_programs(&sections);
@@ -1042,16 +1190,23 @@ fn detect_ts_services(
         }
     }
 
-    // One physical channel is one Channel record.  Preserve the configured
+    // Channel mode stores one physical channel record. Preserve the configured
     // primary service/name and carry all other PAT programs in `extra.services`.
-    // This is also the Service-mode representation: Mirakurun keeps the
-    // logical channel in `channel` and stores the serviceId separately.
+    // Service mode is handled below by emitting one logical:serviceId entry per
+    // detected service while retaining the physical channel for tuning.
     let Some(primary) = old_channel
         .and_then(|channel| channel.serviceId)
         .and_then(|service_id| detected.iter().find(|service| service.serviceId == service_id).cloned())
         .or_else(|| detected.first().cloned()) else {
         return Vec::new();
     };
+    if scan_mode == ScanMode::Service {
+        return detected
+            .into_iter()
+            .map(|service| service_channel(kind, logical, service, old_channel))
+            .collect();
+    }
+
     let mut extra = old_channel.map(|channel| channel.extra.clone()).unwrap_or_default();
     extra.remove("physicalChannel");
     extra.insert("networkId".to_owned(), serde_json::json!(primary.networkId));
@@ -1078,6 +1233,26 @@ fn detect_ts_services(
         tunerChannels: old_channel.and_then(|channel| channel.tunerChannels.clone()),
         extra,
     }]
+}
+
+fn service_channel(
+    kind: ChannelType,
+    logical: &str,
+    service: ChannelService,
+    old_channel: Option<&Channel>,
+) -> Channel {
+    let mut extra = HashMap::new();
+    extra.insert("physicalChannel".to_owned(), serde_json::json!(logical));
+    extra.insert("networkId".to_owned(), serde_json::json!(service.networkId));
+    extra.insert("serviceType".to_owned(), serde_json::json!(service.service_type));
+    Channel {
+        name: service.name,
+        channel_type: kind,
+        channel: format!("{logical}:{}", service.serviceId),
+        serviceId: Some(service.serviceId),
+        tunerChannels: old_channel.and_then(|channel| channel.tunerChannels.clone()),
+        extra,
+    }
 }
 
 /// The scan path is stricter than the public detector compatibility helper:
@@ -1152,7 +1327,7 @@ struct MmtFragment {
 /// three tables deliberately remain independent until the end: a name or a
 /// service id from an unrelated/other table is never enough to create a
 /// channel.
-fn detect_bs4k_services(logical: &str, bytes: &[u8], old: &[Channel], service_type: Option<i64>, _scan_mode: ScanMode) -> Vec<Channel> {
+fn detect_bs4k_services(logical: &str, bytes: &[u8], old: &[Channel], service_type: Option<i64>, scan_mode: ScanMode) -> Vec<Channel> {
     let mut nit_sections: HashMap<(u16, u8, bool), HashMap<u8, TlvNitSection>> = HashMap::new();
     let mut package_ids = HashSet::new();
     let mut services = Vec::new();
@@ -1209,11 +1384,17 @@ fn detect_bs4k_services(logical: &str, bytes: &[u8], old: &[Channel], service_ty
         .collect::<Vec<_>>();
     detected.sort_by_key(|service| service.serviceId);
     detected.dedup_by_key(|service| service.serviceId);
-    bs4k_channel(logical, old, detected)
+    bs4k_channel(logical, old, detected, scan_mode)
 }
 
-fn bs4k_channel(logical: &str, old: &[Channel], detected: Vec<ChannelService>) -> Vec<Channel> {
+fn bs4k_channel(logical: &str, old: &[Channel], detected: Vec<ChannelService>, scan_mode: ScanMode) -> Vec<Channel> {
     let old_channel = configured_channel_for(old, ChannelType::BS4K, logical);
+    if scan_mode == ScanMode::Service {
+        return detected
+            .into_iter()
+            .map(|service| service_channel(ChannelType::BS4K, logical, service, old_channel))
+            .collect();
+    }
     let Some(primary) = old_channel
         .and_then(|channel| channel.serviceId)
         .and_then(|service_id| detected.iter().find(|service| service.serviceId == service_id).cloned())
@@ -1647,9 +1828,9 @@ fn merge_channels(
     types: &[ChannelType],
     refresh: bool,
     _service_type: Option<i64>,
-    _scan_mode: Option<ScanMode>,
+    scan_mode: Option<ScanMode>,
 ) -> Result<Vec<Channel>, String> {
-    merge_channels_with_targets(existing, found, types, refresh, _service_type, _scan_mode, None)
+    merge_channels_with_targets(existing, found, types, refresh, _service_type, scan_mode, None)
 }
 
 fn merge_channels_with_targets(
@@ -1658,14 +1839,14 @@ fn merge_channels_with_targets(
     types: &[ChannelType],
     refresh: bool,
     _service_type: Option<i64>,
-    _scan_mode: Option<ScanMode>,
+    scan_mode: Option<ScanMode>,
     target_sets: Option<&HashMap<ChannelType, HashSet<String>>>,
 ) -> Result<Vec<Channel>, String> {
     crate::config::validate_channel_pairs(existing).map_err(|errors| errors.join("; "))?;
     crate::config::validate_channel_pairs(&found).map_err(|errors| errors.join("; "))?;
     let selected: HashSet<_> = types.iter().copied().collect();
     let found_physical: HashSet<_> = found.iter()
-        .map(|channel| (channel.channel_type, logical_channel(channel)))
+        .map(|channel| (channel.channel_type, canonical_logical_channel(channel)))
         .collect();
     let mut result = existing.iter().filter(|channel| {
         if !selected.contains(&channel.channel_type) {
@@ -1674,33 +1855,46 @@ fn merge_channels_with_targets(
         // The request's target set defines the selected range.  Records outside
         // it are removed even when refresh=false; records inside it are kept
         // without rescanning.  Other channel types are untouched.
+        // CSは旧 `CS<n>` を正規 `ND<n>` に読み替えて突合する。
         let targets = target_sets
             .and_then(|sets| sets.get(&channel.channel_type))
             .cloned()
             .unwrap_or_else(|| scan_targets(channel.channel_type, existing).into_iter().collect());
-        if !targets.contains(&logical_channel(channel)) {
+        let canonical_targets: HashSet<_> = targets
+            .iter()
+            .map(|target| canonical_cs_logical(channel.channel_type, target))
+            .collect();
+        if !canonical_targets.contains(&canonical_logical_channel(channel)) {
             return false;
         }
         if !refresh {
             // Existing records for an in-range target are authoritative.  In
             // particular, do not replace a configured service list or tuner
             // mapping merely because refresh was omitted.
-            return true;
+            return !is_disabled(channel);
         }
-        let physical = (channel.channel_type, logical_channel(channel));
-        // A refresh replaces stale legacy `logical:serviceId` records, while
-        // retaining the logical-channel record long enough to merge manual
-        // fields such as tunerChannels into the newly detected result.
-        found_physical.contains(&physical) && !is_service_entry(channel)
+        let physical = (channel.channel_type, canonical_logical_channel(channel));
+        let mode = effective_scan_mode(channel.channel_type, scan_mode);
+        // A refresh replaces stale entries. Channel mode keeps one logical
+        // record; Service mode replaces an aggregate or old service records
+        // with one entry per detected service.
+        found_physical.contains(&physical)
+            && mode == ScanMode::Channel
+            && !is_service_entry(channel)
     }).cloned().collect::<Vec<_>>();
-    for channel in found {
+    for mut channel in found {
         if !refresh && result.iter().any(|old| {
-            old.channel_type == channel.channel_type && logical_channel(old) == logical_channel(&channel)
+            old.channel_type == channel.channel_type
+                && canonical_channel_field(old.channel_type, &old.channel)
+                    == canonical_channel_field(channel.channel_type, &channel.channel)
+                && !is_disabled(old)
         }) {
             continue;
         }
         if let Some(previous) = result.iter_mut().find(|old| {
-            old.channel_type == channel.channel_type && old.channel == channel.channel
+            old.channel_type == channel.channel_type
+                && canonical_channel_field(old.channel_type, &old.channel)
+                    == canonical_channel_field(channel.channel_type, &channel.channel)
         }) {
             // The detector works from the startup snapshot, while a manual
             // PUT may have changed this record before commit.  Keep manual
@@ -1710,6 +1904,7 @@ fn merge_channels_with_targets(
             let manual_name = previous.name.clone();
             let manual_tuner_channels = previous.tunerChannels.clone();
             let manual_extra = previous.extra.clone();
+            let was_disabled = is_disabled(previous);
             let mut updated = channel;
             updated.name = manual_name;
             updated.tunerChannels = manual_tuner_channels;
@@ -1724,9 +1919,13 @@ fn merge_channels_with_targets(
                     }
                 }
             }
+            if was_disabled {
+                extra.remove("isDisabled");
+            }
             updated.extra = extra;
             *previous = updated;
         } else {
+            channel.extra.remove("isDisabled");
             result.push(channel);
         }
     }
@@ -1741,6 +1940,8 @@ fn is_service_entry(channel: &Channel) -> bool {
 }
 
 fn epoch_seconds() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_secs()).unwrap_or_default() }
+
+fn epoch_millis() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|value| value.as_millis() as u64).unwrap_or_default() }
 
 pub fn config_path(state: &AppState) -> Option<&Path> { state.config_dir.as_deref() }
 
@@ -1763,7 +1964,17 @@ mod tests {
         let bs_targets = scan_targets(ChannelType::BS, &configured_bs);
         assert_eq!(bs_targets.len(), 249);
         assert_eq!(bs_targets.last().map(String::as_str), Some("BS-legacy"));
-        assert_eq!(scan_channels(ChannelType::CS).len(), 23);
+        // CSは110度CSの物理トランスポンダND2/ND4/.../ND24 (偶数のみ12波) が正規。
+        assert_eq!(
+            scan_channels(ChannelType::CS),
+            vec!["ND2", "ND4", "ND6", "ND8", "ND10", "ND12", "ND14", "ND16", "ND18", "ND20", "ND22", "ND24"]
+        );
+        // 旧 `CS<n>` は正規 `ND<n>` に読み替えて互換性を維持する。
+        assert_eq!(canonical_cs_logical(ChannelType::CS, "CS2"), "ND2");
+        assert_eq!(canonical_cs_logical(ChannelType::CS, "CS24"), "ND24");
+        assert_eq!(canonical_cs_logical(ChannelType::CS, "ND4"), "ND4");
+        assert_eq!(canonical_cs_logical(ChannelType::CS, "nd6"), "ND6");
+        assert_eq!(canonical_cs_logical(ChannelType::GR, "CS2"), "CS2");
         assert_eq!(scan_channels(ChannelType::BS4K), vec!["BS4K45328"]);
         let configured = vec![
             Channel { name: "AT-X".into(), channel_type: ChannelType::SKY, channel: "ATXHD".into(), serviceId: None, tunerChannels: None, extra: HashMap::new() },
@@ -1823,6 +2034,81 @@ mod tests {
     }
 
     #[test]
+    fn scan_mode_changes_between_logical_channel_and_service_entries() {
+        let pat = [
+            0x00, 0xb0, 0x11, 0, 1, 0xc1, 0, 0, 0, 101, 0xe1, 0,
+            0, 202, 0xe2, 0, 0, 0, 0, 0,
+        ];
+        let nit = [0x40, 0xb0, 0x09, 0x12, 0x34, 0xc1, 0, 0, 0, 0, 0, 0, 0];
+        fn packet(pid: u16, section: &[u8]) -> Vec<u8> {
+            let mut packet = vec![0xff; 188];
+            packet[..5].copy_from_slice(&[
+                0x47, 0x40 | ((pid >> 8) as u8 & 0x1f), pid as u8, 0x10, 0,
+            ]);
+            packet[5..5 + section.len()].copy_from_slice(section);
+            packet
+        }
+        let mut sdt = vec![0x42, 0, 0, 0, 1, 0xc1, 0, 0, 0, 0, 0];
+        for (service, name) in [(101, b"One!".as_slice()), (202, b"Two!".as_slice())] {
+            sdt.extend_from_slice(&[
+                (service >> 8) as u8, service as u8, 0xfc, 0xf0,
+                (name.len() + 5) as u8, 0x48, (name.len() + 3) as u8, 1, 0,
+                name.len() as u8,
+            ]);
+            sdt.extend_from_slice(name);
+        }
+        let section_length = sdt.len() + 4 - 3;
+        sdt[1] = 0xb0 | ((section_length >> 8) as u8 & 0x0f);
+        sdt[2] = section_length as u8;
+        sdt.extend_from_slice(&[0, 0, 0, 0]);
+        let bytes = [packet(0, &pat), packet(0x10, &nit), packet(0x11, &sdt)].concat();
+
+        let channel = detect_scan_services_filtered(
+            ChannelType::GR, "27", &bytes, &[], None, Some(ScanMode::Channel),
+        );
+        assert_eq!(channel.len(), 1);
+        assert_eq!(channel[0].channel, "27");
+        assert_eq!(channel[0].extra["services"][0]["serviceId"], 202);
+
+        let services = detect_scan_services_filtered(
+            ChannelType::GR, "27", &bytes, &[], None, Some(ScanMode::Service),
+        );
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[0].channel, "27:101");
+        assert_eq!(services[1].channel, "27:202");
+        assert!(services.iter().all(|item| item.extra.get("physicalChannel") == Some(&serde_json::json!("27"))));
+        assert!(crate::config::validate_channel_pairs(&services).is_ok());
+        assert!(crate::config::validate_service_item_ids(&services).is_ok());
+    }
+
+    #[test]
+    fn refresh_false_replaces_disabled_target_with_detected_service() {
+        let disabled = Channel {
+            name: "stale".into(),
+            channel_type: ChannelType::GR,
+            channel: "13".into(),
+            serviceId: Some(999),
+            tunerChannels: None,
+            extra: HashMap::from([(String::from("isDisabled"), serde_json::json!(true))]),
+        };
+        let detected = Channel {
+            name: "fresh".into(),
+            channel_type: ChannelType::GR,
+            channel: "13".into(),
+            serviceId: Some(101),
+            tunerChannels: None,
+            extra: HashMap::new(),
+        };
+        let merged = merge_channels(
+            &[disabled], vec![detected], &[ChannelType::GR], false, None, Some(ScanMode::Channel),
+        ).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "fresh");
+        assert_eq!(merged[0].serviceId, Some(101));
+        assert!(!is_disabled(&merged[0]));
+    }
+
+    #[test]
     fn non_refresh_keeps_only_selected_targets_and_current_scan_mode() {
         let channel = |kind, logical: &str, service_id: Option<i64>| Channel {
             name: logical.to_owned(),
@@ -1837,7 +2123,7 @@ mod tests {
             channel(ChannelType::GR, "99", None),
             channel(ChannelType::GR, "14", Some(999)),
             channel(ChannelType::BS, "101", None),
-            channel(ChannelType::CS, "CS2", None),
+            channel(ChannelType::CS, "ND2", None),
             channel(ChannelType::SKY, "CH585", Some(101)),
             channel(ChannelType::BS4K, "BS4K45328", Some(202)),
         ];
@@ -1858,6 +2144,34 @@ mod tests {
         assert!(merged.iter().any(|item| item.channel_type == ChannelType::CS));
         assert!(merged.iter().any(|item| item.channel_type == ChannelType::SKY));
         assert!(merged.iter().any(|item| item.channel_type == ChannelType::BS4K));
+    }
+
+    #[test]
+    fn cs_legacy_cs_prefix_is_treated_as_nd_alias() {
+        let legacy = Channel {
+            name: "legacy CS".into(),
+            channel_type: ChannelType::CS,
+            channel: "CS2".into(),
+            serviceId: None,
+            tunerChannels: None,
+            extra: HashMap::new(),
+        };
+        // 旧 `CS2` は正規 `ND2` の設定済みとして扱われ、refresh=falseで保持される。
+        assert!(has_enabled_configured_channel(&[legacy.clone()], ChannelType::CS, "ND2"));
+        assert_eq!(canonical_logical_channel(&legacy), "ND2");
+        let merged = merge_channels(
+            &[legacy],
+            Vec::new(),
+            &[ChannelType::CS],
+            false,
+            None,
+            Some(ScanMode::Service),
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+        // 奇数 `CS3` に対応する正規スキャン対象はないが、prefix変換自体は行う。
+        assert_eq!(canonical_cs_logical(ChannelType::CS, "CS3"), "ND3");
+        assert!(!scan_channels(ChannelType::CS).contains(&"ND3".to_owned()));
     }
 
     fn validate_no_duplicate_services(channels: &[Channel]) -> bool {

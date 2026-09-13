@@ -29,6 +29,7 @@ use crate::{
     config::{AppState, Channel, ChannelType},
     error::ApiError,
     routes::api::find_service,
+    scan::{canonical_cs_logical, canonical_logical_channel},
     tuner::{
         command::build_passthrough_command,
         process::{spawn_decoder_program, RegisteredDecoder},
@@ -52,16 +53,18 @@ fn parse_channel_type(s: &str) -> Option<ChannelType> {
 }
 
 fn find_channel(channels: &[Channel], ct: ChannelType, name: &str) -> Option<Channel> {
+    let want = canonical_cs_logical(ct, name);
     channels
         .iter()
         .find(|c| {
             c.channel_type == ct
-                && (c.channel == name
+                && (canonical_logical_channel(c) == want
                     || c.serviceId.is_some_and(|service_id| {
                         c.channel
                             .rsplit_once(':')
                             .is_some_and(|(logical, suffix)| {
-                                logical == name && suffix.parse::<i64>().ok() == Some(service_id)
+                                canonical_cs_logical(ct, logical) == want
+                                    && suffix.parse::<i64>().ok() == Some(service_id)
                             })
                     }))
         })

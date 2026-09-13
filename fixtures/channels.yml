@@ -28,3 +28,12 @@
   tunerChannels:
     DVB-C-0: "13"
     DVB-C-1: "27"
+
+- name: sample CS
+  type: CS
+  channel: ND2
+  serviceId: 101
+  networkId: 7
+  # recpt1のようにCS2形式を要求するチューナーでは次のように読み替える。
+  # tunerChannels:
+  #   PT3-0: CS2

@@ -18,7 +18,7 @@ Hotarun自身は録画、EPG収集、映像変換を行いません。
 - 1物理チャンネル内の複数サービス検出と`ServiceItemId`列挙
 - TS用`decoder`、BS4K用`tlvDecoder`のクライアント単位の外部プロセス
 - Mirakurun互換を目指した設定・一覧・状態・ストリームAPI
-- チャンネルスキャン（GR / BS / CS / SKY / BS4K、同期・非同期・進捗・中止・dryRun）
+- Mirakurun互換のチャンネルスキャンAPI（GR / BS / CS / SKY / BS4K、同期・非同期・進捗・中止・dryRun）
 - 設定保存APIと再起動要求API
 - 互換用CIDR設定、Origin / Referer検査、CORS
 - Unix socket、peer credential検証、socket mode `0660`
@@ -166,6 +166,8 @@ cargo build --release
 
 `tunerChannels`を指定すると、`tuner.name`ごとに物理チャンネルを上書きします。指定がなければ`channel`を使用します。
 
+CSの論理チャンネルはMirakurun互換の`ND2`、`ND4`、…、`ND24`（110度CSの12トランスポンダ、偶数のみ）が正規です。旧来の`CS2`のような`CS<n>`表記はAPIのlookupとスキャン突合では`ND<n>`と同一視しますが、表示・スキャン生成は`NDxx`に統一します。既存の`CSxx`設定は`refresh=true`での再スキャンか、`channel`を`NDxx`へ手動変更して移行してください。
+
 スキャンで複数サービスを検出した場合は、同じ`(type, channel)`のレコードに主サービスを`serviceId` / `name`として保存し、追加サービスを拡張フィールド`services`に保存します。
 
 ### `tuners.yml`
@@ -190,7 +192,7 @@ cargo build --release
   decoder: cas-decoder --arg1
 ```
 
-- `command`の`<channel>`は、`tunerChannels`解決後の物理チャンネルへ置換します。
+- `command`の`<channel>`は、`tunerChannels`解決後の物理チャンネルへ置換します。CSは論理`NDxx`がそのまま渡ります。`recpt1`のように`CS2`形式を要求するチューナーでは、`tunerChannels`で`ND2: CS2`のようにマッピングしてください。
 - 未知の`<...>`は空文字になります。
 - 引用符とバックスラッシュによる引数分割に対応しますが、shellは起動しません。
 - `tlvDecoder`は`BS4K`専用です。`decoder`はGR / BS / CS / SKYのTS用です。
@@ -331,11 +333,13 @@ DELETE /api/config/channels/scan
 | `async` | `false` | `true`なら202を返してバックグラウンド実行 |
 | `serviceType` | なし | 検出サービス種別で絞り込む |
 
-- 同期スキャンは完了後に`200 text/plain; charset=utf-8`でYAMLを返します。
-- 非同期スキャンは`202`を返し、GETで`status`、`progress`、`scanned`、`total`、`channels`、`error`を確認します。
-- DELETEは実行中スキャンを中止し、成功時は`206`を返します。
+- 同期スキャンは完了後に`200 text/plain; charset=utf-8`でスキャンログ（検出数・引き継ぎ数を含む）を返します。最終チャンネル結果はGETの`result`/`channels`で確認します。
+- 非同期スキャンは`202`を返し、GETでMirakurun互換の`status`（`not_started`、`scanning`、`completed`、`cancelled`、`error`）、`isScanning`、`progress`、`currentChannel`、`scanLog`、`result`を確認できます。Hotarun固有の`scanned`、`total`、`channels`、`error`も併せて返します。
+- DELETEは実行中スキャンを中止し、成功時は`206`と`{"status":"stopping",...}`を返します。実行中でなければ`404`、停止要求済みの競合は`409`です。
 - 1論理チャンネルのタイムアウトは20秒、全体のタイムアウトは30分です。
 - TSはPAT、actual NIT、actual SDTが揃うまで有効なサービスとして保存しません。
+- `scanMode=Channel`（GRの既定）は1論理チャンネルに主サービスと追加サービスをまとめ、`scanMode=Service`（BS/CS/SKY/BS4Kの既定）はサービスごとに`<論理チャンネル>:<serviceId>`のエントリを生成します。Service modeでも`physicalChannel`と論理チャンネルAPI lookupを維持し、サービスの`ServiceItemId`を検証します。CSの論理チャンネルは`ND2`、`ND4`、…、`ND24`です。
+- CSの既定走査範囲は`ND2`-`ND24`の偶数12波です（GR50 + BS248 + CS12 + BS4K1 = 311、SKY設定時は+SKY数）。旧`CSxx`連番23波とは異なり、存在しない奇数トランスポンダを走査しません。
 - SKYはBS4Kとは異なりMPEG-2 TS経路で走査します。MirakurunにはSKY用の固定走査範囲がないため、`channels.yml`に設定済みのSKY識別子（例: `CH585`、`ATXHD`）を走査対象とし、推測した数値範囲は追加しません。Mirakurun互換のサービス種別（`0x01`、`0x02`、`0xA1`、`0xA4`、`0xA5`、`0xAD`、`0xC0`）だけを登録します。
 - BS4Kはactual TLV-NITとMMT PLT / SDTを検出し、fixtureでfragment、interleave、複数serviceを検証しています。
 - スキャンは既存の共有ストリームを利用でき、スキャンが所有していないチューナープロセスを停止しません。
@@ -348,10 +352,9 @@ DELETE /api/config/channels/scan
 - Dashboard: server status、tuner status、active streams
 - Tuners: チューナー一覧と状態
 - Channels: チャンネル一覧
-- Scan: GR / BS / CS / SKY / BS4Kの非同期スキャン、進捗表示、中止
 - Configuration: `channels`、`tuners`、`server`の表示・保存
 
-UIはRustバイナリに埋め込んだ素のHTML/CSS/JavaScriptです。設定保存やスキャンはHTTP APIを呼び出します。
+UIはRustバイナリに埋め込んだ素のHTML/CSS/JavaScriptです。スキャン操作はWeb UIには置かず、Mirakurun互換のHTTP APIだけで行います。
 
 ## systemd
 

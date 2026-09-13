@@ -16,7 +16,7 @@ fn state() -> Arc<AppState> {
         vec![
             channel("GR", "27", ChannelType::GR, None),
             channel("BS", "BS01_0", ChannelType::BS, None),
-            channel("CS", "CS2", ChannelType::CS, None),
+            channel("CS", "ND2", ChannelType::CS, None),
             channel("BS4K", "logical", ChannelType::BS4K, Some("tlv")),
         ],
         vec![Tuner {
@@ -97,7 +97,7 @@ async fn real_http_router_covers_gr_bs_cs_and_bs4k_tlv_headers_decode_and_eof() 
     for (uri, is_tlv) in [
         ("/api/channels/GR/27/stream", false),
         ("/api/channels/BS/BS01_0/stream", false),
-        ("/api/channels/CS/CS2/stream", false),
+        ("/api/channels/CS/ND2/stream", false),
         ("/api/channels/BS4K/logical/stream?decode=0", true),
     ] {
         let state = state();
@@ -111,6 +111,34 @@ async fn real_http_router_covers_gr_bs_cs_and_bs4k_tlv_headers_decode_and_eof() 
             assert!(body.len() >= 188 && body.chunks_exact(188).all(|packet| packet[0] == 0x47));
         }
         state.manager.stop_all().await;
+    }
+}
+
+#[tokio::test]
+async fn cs_legacy_prefix_is_accepted_as_nd_alias() {
+    // 保存がND2でも旧CS2のURLを受け付けるし、その逆も受け付ける。
+    for (current_state, uri) in [
+        (state(), "/api/channels/CS/CS2/stream"),
+        (
+            Arc::new(AppState::from_lists(
+                vec![channel("CS", "CS2", ChannelType::CS, None)],
+                vec![Tuner {
+                    name: "fixture".to_owned(),
+                    types: vec![ChannelType::CS],
+                    command: Some(format!("{} dispatch <channel>", fixture())),
+                    tlv_decoder: None,
+                    decoder: None,
+                    extra: HashMap::new(),
+                }],
+            )),
+            "/api/channels/CS/ND2/stream",
+        ),
+    ] {
+        let (status, headers, body) = read_stream_response(Arc::clone(&current_state), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(headers[header::CONTENT_TYPE], "video/MP2T");
+        assert!(body.len() >= 188 && body.chunks_exact(188).all(|packet| packet[0] == 0x47), "{uri}");
+        current_state.manager.stop_all().await;
     }
 }
 

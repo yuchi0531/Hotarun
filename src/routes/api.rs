@@ -12,6 +12,7 @@ use serde::Serialize;
 use crate::{
     config::{channel_services, AppState, Channel, ChannelType},
     error::ApiError,
+    scan::{canonical_cs_logical, canonical_logical_channel},
     tuner::TunerState,
 };
 
@@ -68,16 +69,19 @@ fn parse_channel_type(value: &str) -> Option<ChannelType> {
 }
 
 fn find_channel(channels: &[Channel], channel_type: ChannelType, channel: &str) -> Option<Channel> {
+    // CSは旧 `CS<n>` と正規 `ND<n>` を同一トランスポンダとして受け付ける。
+    let want = canonical_cs_logical(channel_type, channel);
     channels
         .iter()
         .find(|item| {
             item.channel_type == channel_type
-                && (item.channel == channel
+                && (canonical_logical_channel(item) == want
                     || item.serviceId.is_some_and(|service_id| {
                         item.channel
                             .rsplit_once(':')
                             .is_some_and(|(logical, suffix)| {
-                                logical == channel && suffix.parse::<i64>().ok() == Some(service_id)
+                                canonical_cs_logical(channel_type, logical) == want
+                                    && suffix.parse::<i64>().ok() == Some(service_id)
                             })
                     }))
         })
@@ -242,7 +246,7 @@ pub fn service_items(channels: &[Channel]) -> Vec<ServiceItem> {
                     service_type: service.service_type,
                     channel: ServiceChannel {
                         channel_type: channel.channel_type,
-                        channel: channel.channel.clone(),
+                        channel: canonical_logical_channel(channel),
                     },
             }));
         }
@@ -267,7 +271,7 @@ pub fn find_service(channels: &[Channel], id: i64) -> Option<(ServiceItem, Chann
                     networkId: service.networkId,
                     name: service.name,
                     service_type: service.service_type,
-                    channel: ServiceChannel { channel_type: channel.channel_type, channel: channel.channel.clone() },
+                channel: ServiceChannel { channel_type: channel.channel_type, channel: canonical_logical_channel(channel) },
                 }, channel.clone()))
             })
         })

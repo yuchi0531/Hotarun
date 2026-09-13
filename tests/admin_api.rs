@@ -27,6 +27,10 @@ async fn admin_routes_expose_health_ui_and_scan_lifecycle() {
 
     let response = app(Arc::clone(&state)).oneshot(Request::builder().uri("/api/config/channels/scan").body(Body::empty()).unwrap()).await.unwrap();
     let status: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(status["status"], "completed");
+    assert_eq!(status["isScanning"], false);
+    assert!(status["scanLog"].is_array());
+    assert!(status["result"].is_array());
     assert_eq!(status["refresh"], false);
 
     let response = app(Arc::clone(&state)).oneshot(Request::builder().uri("/api/config/channels/scan").body(Body::empty()).unwrap()).await.unwrap();
@@ -59,6 +63,11 @@ async fn admin_config_routes_persist_atomically_and_bound_log_history() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["code"], 200);
+    assert_eq!(body["reason"], "saved; restart required");
+    assert_eq!(body["errors"], serde_json::json!([]));
+    assert_eq!(body["restartRequired"], true);
     assert!(fs::read_to_string(directory.join("server.yml"))
         .unwrap()
         .contains("CIDR:"));
@@ -68,6 +77,11 @@ async fn admin_config_routes_persist_atomically_and_bound_log_history() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 16 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["code"], 200);
+    assert_eq!(body["reason"], "saved; restart required");
+    assert_eq!(body["errors"], serde_json::json!([]));
+    assert_eq!(body["restartRequired"], true);
     assert_eq!(fs::read_to_string(directory.join("channels.yml")).unwrap(), "[]\n");
 
     let response = app(Arc::clone(&state))
@@ -402,8 +416,10 @@ async fn scan_persists_one_channel_and_exposes_all_detected_services() {
         let body = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
         panic!("scan failed: {}", String::from_utf8_lossy(&body));
     }
+    let scan_log = String::from_utf8(to_bytes(response.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap();
+    assert!(scan_log.contains("channel scan completed"));
     let channels: serde_yaml::Value =
-        serde_yaml::from_slice(&to_bytes(response.into_body(), 256 * 1024).await.unwrap()).unwrap();
+        serde_yaml::from_str(&fs::read_to_string(directory.join("channels.yml")).unwrap()).unwrap();
     assert_eq!(channels.as_sequence().unwrap().len(), 50);
     let first = channels.as_sequence().unwrap().iter().find(|channel| {
         channel["channel"].as_str() == Some("13")
@@ -459,20 +475,35 @@ async fn sky_scan_uses_configured_identifier_and_mpeg_ts_detection() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let channels: serde_yaml::Value = serde_yaml::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
-    assert_eq!(channels.as_sequence().unwrap().len(), 1);
-    assert_eq!(channels[0]["type"].as_str(), Some("SKY"));
-    assert_eq!(channels[0]["channel"].as_str(), Some("CH585"));
-    assert_eq!(channels[0]["serviceId"].as_i64(), Some(101));
-    assert_eq!(channels[0]["name"].as_str(), Some("SPOTV"));
-    assert_eq!(channels[0]["serviceType"].as_i64(), Some(1));
-    assert_eq!(channels[0]["services"][0]["serviceId"].as_i64(), Some(202));
-    assert_eq!(channels[0]["services"][0]["name"].as_str(), Some("Two!"));
-    assert_eq!(channels[0]["services"][0]["serviceType"].as_i64(), Some(2));
-    assert_eq!(channels[0]["tunerChannels"]["fixture"].as_str(), Some("13"));
-    assert!(channels.as_sequence().unwrap().iter().all(|channel| channel.get("physicalChannel").is_none()));
+    let scan_log = String::from_utf8(to_bytes(response.into_body(), 64 * 1024).await.unwrap().to_vec()).unwrap();
+    assert!(scan_log.contains("channel scan completed"));
+    let channels: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(directory.join("channels.yml")).unwrap()).unwrap();
+    assert_eq!(channels.as_sequence().unwrap().len(), 2);
+    let first = channels.as_sequence().unwrap().iter().find(|channel| channel["serviceId"] == 101).unwrap();
+    let second = channels.as_sequence().unwrap().iter().find(|channel| channel["serviceId"] == 202).unwrap();
+    assert_eq!(first["type"].as_str(), Some("SKY"));
+    assert_eq!(first["channel"].as_str(), Some("CH585:101"));
+    assert_eq!(first["name"].as_str(), Some("One!"));
+    assert_eq!(first["serviceType"].as_i64(), Some(1));
+    assert_eq!(second["channel"].as_str(), Some("CH585:202"));
+    assert_eq!(second["name"].as_str(), Some("Two!"));
+    assert_eq!(second["serviceType"].as_i64(), Some(2));
+    assert_eq!(first["tunerChannels"]["fixture"].as_str(), Some("13"));
+    assert_eq!(second["tunerChannels"]["fixture"].as_str(), Some("13"));
+    assert!(channels.as_sequence().unwrap().iter().all(|channel| channel["physicalChannel"].as_str() == Some("CH585")));
 
     let reloaded = Arc::new(AppState::load_from_dir(&directory));
+    let status_response = app(Arc::clone(&state))
+        .oneshot(Request::builder().uri("/api/config/channels/scan").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&to_bytes(status_response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(status["status"], "completed");
+    assert_eq!(status["isScanning"], false);
+    assert_eq!(status["progress"], 100);
+    assert!(status["scanLog"].as_array().unwrap().iter().any(|line| line.as_str().unwrap_or_default().contains("completed")));
+    assert_eq!(status["newCount"], 0);
+    assert_eq!(status["takeoverCount"], 2);
     for service_id in [101, 202] {
         let response = app(Arc::clone(&reloaded))
             .oneshot(Request::builder().uri(format!("/api/services/{service_id}")).body(Body::empty()).unwrap())
@@ -515,12 +546,55 @@ async fn sky_scan_refresh_false_preserves_existing_target_without_a_tuner() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let channels: serde_yaml::Value = serde_yaml::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let scan_log = String::from_utf8(to_bytes(response.into_body(), 64 * 1024).await.unwrap().to_vec()).unwrap();
+    assert!(scan_log.contains("channel scan completed"));
+    let channels: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(directory.join("channels.yml")).unwrap()).unwrap();
     assert_eq!(channels[0]["channel"].as_str(), Some("CH585"));
     assert_eq!(channels[0]["services"][0]["serviceId"].as_i64(), Some(202));
     let saved: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(directory.join("channels.yml")).unwrap()).unwrap();
     assert_eq!(saved[0]["channel"].as_str(), Some("CH585"));
     assert_eq!(saved[0]["tunerChannels"]["fixture"].as_str(), Some("13"));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn refresh_false_rescans_and_replaces_disabled_channel() {
+    let fixture = std::env::var("CARGO_BIN_EXE_hotarun-test-fixture").unwrap();
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::env::temp_dir().join(format!("hotarun-scan-disabled-{suffix}"));
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("channels.yml"),
+        "- name: stale disabled\n  type: GR\n  channel: '13'\n  serviceId: 999\n  isDisabled: true\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.join("tuners.yml"),
+        format!(
+            "- name: fixture\n  types: [GR]\n  command: '{} scan-dispatch <channel>'\n",
+            fixture.replace('\'', "''")
+        ),
+    )
+    .unwrap();
+    let state = Arc::new(AppState::load_from_dir(&directory));
+    let response = app(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/config/channels/scan?type=GR&scanMode=Channel&refresh=false")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let log = String::from_utf8(to_bytes(response.into_body(), 256 * 1024).await.unwrap().to_vec()).unwrap();
+    assert!(log.contains("channel scan completed"));
+
+    let saved: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(directory.join("channels.yml")).unwrap()).unwrap();
+    let channel = saved.as_sequence().unwrap().iter().find(|item| item["channel"] == "13").unwrap();
+    assert_eq!(channel["serviceId"].as_i64(), Some(101));
+    assert_ne!(channel["isDisabled"].as_bool(), Some(true), "saved disabled channel: {saved:?}");
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -580,15 +654,16 @@ async fn default_scan_keeps_partial_results_and_refreshes_only_successful_types(
             .unwrap();
         let status: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
-        if status["status"] != "running" {
+        if status["status"] != "scanning" {
             break status;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     };
-    assert_eq!(status["status"], "complete");
+    assert_eq!(status["status"], "completed");
     assert_eq!(status["progress"], 100);
-    assert_eq!(status["scanned"], 323);
-    assert_eq!(status["total"], 323);
+    // GR50 + BS248 + CS12(ND2-ND24偶数) + SKY1 + BS4K1 = 312
+    assert_eq!(status["scanned"], 312);
+    assert_eq!(status["total"], 312);
     assert!(status["channels"].as_array().unwrap().iter().any(|channel| {
         channel["type"] == "GR" && channel["channel"] == "13"
     }));
@@ -641,7 +716,9 @@ async fn scan_service_type_filter_reselects_primary_from_matching_service() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let channels: serde_yaml::Value = serde_yaml::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    let scan_log = String::from_utf8(to_bytes(response.into_body(), 64 * 1024).await.unwrap().to_vec()).unwrap();
+    assert!(scan_log.contains("channel scan completed"));
+    let channels: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(directory.join("channels.yml")).unwrap()).unwrap();
     assert_eq!(channels[0]["serviceId"].as_i64(), Some(202));
     // The configured name is a manual field and remains authoritative while
     // the scan replaces detected service metadata.
@@ -872,7 +949,7 @@ async fn scan_started_before_http_stream_uses_fanout_and_releases_only_its_lease
             &to_bytes(response.into_body(), 64 * 1024).await.unwrap(),
         )
         .unwrap();
-        if status["status"] == "complete" {
+        if status["status"] == "completed" {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -945,7 +1022,7 @@ async fn scan_commit_preserves_tuner_channels_changed_by_inflight_put() {
             &to_bytes(response.into_body(), 64 * 1024).await.unwrap(),
         )
         .unwrap();
-        if status["status"] == "complete" {
+        if status["status"] == "completed" {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1008,7 +1085,9 @@ async fn shared_scan_reads_multiple_fanout_chunks_before_detecting_services() {
     assert_eq!(state.manager.pid(0).await.unwrap(), pid);
     assert_eq!(state.manager.use_count(0).await.unwrap(), 1);
     let body = to_bytes(response.into_body(), 256 * 1024).await.unwrap();
-    let channels: serde_yaml::Value = serde_yaml::from_slice(&body).unwrap();
+    let scan_log = String::from_utf8(body.to_vec()).unwrap();
+    assert!(scan_log.contains("channel scan completed"));
+    let channels: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(directory.join("channels.yml")).unwrap()).unwrap();
     assert_eq!(channels.as_sequence().unwrap().len(), 1);
     assert!(channels[0]["services"].as_sequence().is_some_and(|services| !services.is_empty()));
 
